@@ -1,0 +1,16 @@
+[package]
+name = "iree-runtime"
+description = "Safe Rust wrapper over the IREE runtime C API (inference only)."
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+publish.workspace = true
+
+[features]
+default = []
+# `Element` impls for `half::f16` / `half::bf16`.
+half = ["dep:half"]
+
+[dependencies]
+iree-sys.workspace = true
+half = { version = "2", optional = true }

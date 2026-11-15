@@ -1,0 +1,4 @@
+[toolchain]
+# Active development: track latest nightly (see AGENTS.md, "Dependencies").
+channel = "nightly"
+components = ["rustfmt", "clippy", "rust-src", "rustc-codegen-cranelift-preview"]

@@ -1,0 +1,12 @@
+[package]
+name = "iree-sys"
+description = "Hand-written raw FFI bindings to the IREE runtime C API (inference subset, IREE v3.13.0)."
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+publish.workspace = true
+links = "iree_runtime_unified"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,35 @@
+# Pins LLVM for debug builds: some cargo builds default the dev profile to
+# Cranelift, whose code crashes across the IREE C FFI.
+cargo-features = ["codegen-backend"]
+
+[workspace]
+members = [
+    "crates/iree-sys",
+    "crates/iree-runtime",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.metadata.iree]
+# Must match the IREE runtime that iree-sys links against and the pip
+# `iree-base-compiler` used to produce .vmfb files (vmfb is not ABI-stable
+# across IREE versions).
+version = "3.13.0"
+
+# Tests: light optimisation only, so builds stay fast and stay debuggable.
+# Heavy compute (the embedding model on IREE) is C built by CMake in Release, unaffected.
+[profile.dev]
+codegen-backend = "llvm"
+
+[profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 1
+
+[workspace.dependencies]
+iree-sys = { path = "crates/iree-sys" }

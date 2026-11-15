@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  # Deterministic tests only: the GPU tests (`just test-gpu`) are Metal and
+  # run locally; the model tests skip without a model repository.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (rust-toolchain.toml, nightly)
+        run: rustup toolchain install && rustup show
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,just
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # IREE runtime: clone + build once, then cached until what is built
+      # (version, submodules, CMake flags) changes, not on any justfile edit.
+      - name: IREE cache key
+        id: iree-key
+        run: echo "key=$(just --evaluate iree_cache_key)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache IREE
+        id: iree-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/iree
+            third_party/iree-build
+          key: iree-${{ runner.os }}-${{ steps.iree-key.outputs.key }}
+
+      - name: Build IREE runtime
+        if: steps.iree-cache.outputs.cache-hit != 'true'
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          command -v ninja || sudo apt-get install -y ninja-build
+          just iree
+
+      - name: Compile test modules
+        run: just testdata
+
+      - name: Format
+        run: just fmt-check
+
+      - name: Clippy
+        run: just clippy
+
+      - name: Tests (nextest)
+        run: just test --profile ci
+
+      - name: Doctests
+        run: just doctest
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-linux
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
