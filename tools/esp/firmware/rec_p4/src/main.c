@@ -115,7 +115,7 @@ static int compare(const float* y, const float* expected, int steps, int classes
   return differing == 0;
 }
 
-static iree_status_t run(void) {
+static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_t vmfb_size) {
   iree_allocator_t host_allocator = iree_allocator_system();
   const iree_hal_dim_t in_dims[] = MODEL_INPUT_DIMS;
   const iree_hal_dim_t out_dims[] = MODEL_OUTPUT_DIMS;
@@ -125,6 +125,7 @@ static iree_status_t run(void) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "expected.bin size");
   }
 
+  printf("\n=== %s ===\n", label);
   iree_runtime_instance_options_t instance_options;
   iree_runtime_instance_options_initialize(&instance_options);
   iree_runtime_instance_t* instance = NULL;
@@ -140,14 +141,12 @@ static iree_status_t run(void) {
                                                      host_allocator, &session);
   }
   if (iree_status_is_ok(status)) {
-    // The module stays in flash; the session references it, nothing is freed.
     const int64_t t0 = esp_timer_get_time();
     status = iree_runtime_session_append_bytecode_module_from_memory(
-        session, iree_make_const_byte_span(vmfb_start, vmfb_end - vmfb_start),
-        iree_allocator_null());
+        session, iree_make_const_byte_span(vmfb_data, vmfb_size), iree_allocator_null());
     if (iree_status_is_ok(status)) {
       printf("module loaded in %lld ms (%u bytes at %p)\n", (esp_timer_get_time() - t0) / 1000,
-             (unsigned)(vmfb_end - vmfb_start), (const void*)vmfb_start);
+             (unsigned)vmfb_size, (const void*)vmfb_data);
     }
   }
   print_heap("loaded");
@@ -175,9 +174,12 @@ static iree_status_t run(void) {
     }
     iree_hal_buffer_view_release(input);
 
+    espdl_p4_reset_stats();
     const int64_t t0 = esp_timer_get_time();
     if (iree_status_is_ok(status)) status = iree_runtime_call_invoke(&call, 0);
     const int64_t t1 = esp_timer_get_time();
+    espdl_p4_stats_t st;
+    espdl_p4_get_stats(&st);
 
     iree_hal_buffer_view_t* output = NULL;
     if (iree_status_is_ok(status)) {
@@ -191,9 +193,17 @@ static iree_status_t run(void) {
     iree_hal_buffer_view_release(output);
     iree_runtime_call_deinitialize(&call);
     if (iree_status_is_ok(status)) {
-      printf("run %d: %lld ms\n", r, (t1 - t0) / 1000);
+      const int64_t total_us = t1 - t0;
+      const int64_t espdl_us = st.conv_setup_us + st.conv_kernel_us + st.lut_us +
+                               st.binary_setup_us + st.binary_kernel_us;
+      printf("run %d: total %lld ms (%lld us) | conv %lu (setup %.2f + kernel %.2f ms) | "
+             "lut %lu (%.2f ms) | bin %lu (setup %.2f + kernel %.2f ms) | iree/other %.2f ms\n",
+             r, total_us / 1000, total_us,
+             (unsigned long)st.conv_calls, st.conv_setup_us / 1000.0, st.conv_kernel_us / 1000.0,
+             (unsigned long)st.lut_calls, st.lut_us / 1000.0,
+             (unsigned long)st.binary_calls, st.binary_setup_us / 1000.0, st.binary_kernel_us / 1000.0,
+             (total_us - espdl_us) / 1000.0);
       ok_runs += compare(y, (const float*)expected_start, steps, classes);
-      print_heap("after run");
     }
   }
   if (iree_status_is_ok(status)) {
@@ -205,6 +215,23 @@ static iree_status_t run(void) {
   iree_runtime_session_release(session);
   iree_hal_device_release(device);
   iree_runtime_instance_release(instance);
+  return status;
+}
+
+static iree_status_t run(void) {
+  const size_t vmfb_size = (size_t)(vmfb_end - vmfb_start);
+  IREE_RETURN_IF_ERROR(run_case("flash xip (.rodata)", vmfb_start, vmfb_size));
+
+  uint8_t* psram_vmfb = heap_caps_aligned_alloc(64, vmfb_size, MALLOC_CAP_SPIRAM);
+  if (!psram_vmfb) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "psram vmfb alloc");
+  }
+  const int64_t tc0 = esp_timer_get_time();
+  memcpy(psram_vmfb, vmfb_start, vmfb_size);
+  printf("\ncopied vmfb (%u bytes) flash->psram in %.2f ms\n", (unsigned)vmfb_size,
+         (esp_timer_get_time() - tc0) / 1000.0);
+  iree_status_t status = run_case("psram copy", psram_vmfb, vmfb_size);
+  heap_caps_free(psram_vmfb);
   return status;
 }
 

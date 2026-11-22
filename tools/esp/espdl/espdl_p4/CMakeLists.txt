@@ -2,4 +2,4 @@
 idf_component_register(
     SRCS "espdl_p4.cpp" "espdl_p4_imports.c"
     INCLUDE_DIRS "." ".."
-    REQUIRES espressif__esp-dl)
+    REQUIRES espressif__esp-dl esp_timer)

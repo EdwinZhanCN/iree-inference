@@ -23,6 +23,20 @@ int espdl_p4_binary_s8(const int8_t* a, const int8_t* b, const int32_t* params,
 // The import named name (e.g. "espdl_conv2d_s8"), or NULL.
 espdl_import_fn_t espdl_p4_lookup(const char* name);
 
+typedef struct {
+  uint32_t conv_calls;
+  int64_t conv_setup_us;
+  int64_t conv_kernel_us;
+  uint32_t lut_calls;
+  int64_t lut_us;
+  uint32_t binary_calls;
+  int64_t binary_setup_us;
+  int64_t binary_kernel_us;
+} espdl_p4_stats_t;
+
+void espdl_p4_reset_stats(void);
+void espdl_p4_get_stats(espdl_p4_stats_t* out);
+
 #ifdef __cplusplus
 }
 #endif
