@@ -79,6 +79,16 @@ typedef struct {
   size_t y_offset;
 } espdl_dequant_s8_f32_args_t;
 
+// espdl_avg_pool2d_s8: x (i8), params, y (i8).
+typedef struct {
+  const int8_t* x;
+  size_t x_offset;
+  const int32_t* params;
+  size_t params_offset;
+  int8_t* y;
+  size_t y_offset;
+} espdl_avg_pool2d_s8_args_t;
+
 #ifdef __cplusplus
 }
 #endif

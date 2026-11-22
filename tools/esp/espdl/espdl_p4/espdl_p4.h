@@ -21,6 +21,7 @@ int espdl_p4_binary_s8(const int8_t* a, const int8_t* b, const int32_t* params,
                        int8_t* y);
 int espdl_p4_quant_s8(const float* x, const int32_t* params, int8_t* y);
 int espdl_p4_dequant_s8_f32(const int8_t* x, const int32_t* params, float* y);
+int espdl_p4_avg_pool2d_s8(const int8_t* x, const int32_t* params, int8_t* y);
 
 // The import named name (e.g. "espdl_conv2d_s8"), or NULL.
 espdl_import_fn_t espdl_p4_lookup(const char* name);
@@ -38,6 +39,8 @@ typedef struct {
   int64_t quant_us;
   uint32_t dequant_calls;
   int64_t dequant_us;
+  uint32_t pool_calls;
+  int64_t pool_us;
 } espdl_p4_stats_t;
 
 void espdl_p4_reset_stats(void);

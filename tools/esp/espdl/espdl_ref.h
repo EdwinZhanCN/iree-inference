@@ -109,6 +109,27 @@ enum {
 
 int espdl_ref_dequant_s8_f32(const int8_t* x, const int32_t* params, float* y);
 
+// Parameters of espdl_ref_avg_pool2d_s8, N = 1, NHWC, no padding.
+enum {
+  ESPDL_POOL_H = 0,
+  ESPDL_POOL_W,
+  ESPDL_POOL_C,
+  ESPDL_POOL_KH,
+  ESPDL_POOL_KW,
+  ESPDL_POOL_SH,
+  ESPDL_POOL_SW,
+  ESPDL_POOL_OH,
+  ESPDL_POOL_OW,
+  ESPDL_POOL_X_EXP,
+  ESPDL_POOL_Y_EXP,
+  ESPDL_POOL_PARAM_COUNT,
+};
+
+// Quantized 2D average pooling, N = 1, NHWC, unpadded:
+//   x: int8 [H][W][C]   scale 2^x_exp
+//   y: int8 [OH][OW][C] scale 2^y_exp
+int espdl_ref_avg_pool2d_s8(const int8_t* x, const int32_t* params, int8_t* y);
+
 #ifdef __cplusplus
 }
 #endif

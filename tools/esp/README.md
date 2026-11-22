@@ -54,12 +54,13 @@ esp-dl kernel imports. It runs on IREE's input-phase IR
 (`iree-compile --compile-to=input`), reads the int8 weights, bias and scales
 from the constants, and checks them against esp-dl's scheme: zero point 0,
 power-of-two scales, bias in the accumulator's scale. Ops that fail a check
-stay with IREE. Five imports cover what it replaces:
+stay with IREE. Six imports cover what it replaces:
 
 - `espdl_conv2d_s8`: 1×1 and k×k convolutions (stride, padding, dilation,
-  groups), depthwise, 1D convolutions, matrix products with constant
-  weights, optional ReLU. Weights are passed channels-last with a parameter
-  array.
+  groups), depthwise, 1D convolutions (including unit-dim `collapse_shape` /
+  `expand_shape` wrappers around depthwise 1D convs), matrix products with
+  constant weights, optional ReLU. Weights are passed channels-last with a
+  parameter array.
 - `espdl_lut_s8`: any chain of elementwise ops from one int8 tensor to a
   quantize (GELU, HardSwish, HardSigmoid, Sigmoid, requantization), as
   esp-dl's 256-entry LUT. The script fills each table by running the chain
@@ -69,6 +70,12 @@ stay with IREE. Five imports cover what it replaces:
   channel Mul, bias Add), the second one repeating along trailing dims.
   With power-of-two scales the exact integer result rounded half to even
   equals the float QDQ result.
+- `espdl_avg_pool2d_s8`: valid-padded 2D average pooling and global spatial
+  average reductions (`H×W -> 1×1`) with power-of-two input/output scales.
+  On ESP32-P4, 16-aligned channel counts use esp-dl's PIE
+  `dl_esp32p4_s8_avg_pool2d_hwc_sum` for the exact `int32` sum, followed by
+  float division by `area` and RV32F `fcvt.w.s ..., rne` to match ORT-QDQ /
+  MLIR rounding bit-for-bit.
 - `espdl_quant_s8`: boundary `f32 -> i8` quantization (power-of-two scale,
   round half to even, zero point 0) fused with optional `NCHW -> NHWC`
   transpose (`[outer, c, hw] -> [outer, hw, c]`).
@@ -109,25 +116,23 @@ just esp-ppocr-p4 rec iree # P4 static library, IREE codegen only
 
 | Model | Ops to esp-dl | Transposes left | Host result | P4 `.text` |
 | --- | --- | --- | --- | --- |
-| rec | 74: 38 conv/MatMul, 22 LUT, 12 Add/Mul, 1 quant_nhwc, 1 dequant_f32 | 2 | bit-exact with ORT and ESP-PPQ | 16 KiB (IREE only: 7,763 KiB) |
-| det | 162: 85 conv, 42 LUT, 35 Add/Mul | 7 | bit-exact with ORT and ESP-PPQ | 58 KiB |
+| rec | 79: 39 conv/MatMul, 22 LUT, 12 Add/Mul, 4 avg_pool, 1 quant_nhwc, 1 dequant_f32 | 0 | bit-exact with ORT and ESP-PPQ | 2 KiB (IREE only: 7,763 KiB) |
+| det | 178: 85 conv, 42 LUT, 35 Add/Mul, 13 avg_pool, 3 quant_nhwc | 4 | bit-exact with ORT and ESP-PPQ | 32 KiB |
 
-What stays with IREE: the global average pools of the SE blocks and
-AveragePool (reductions), Resize, Concat, MaxPool, the two ConvTranspose of
-det (lowered `InsertZeros`), and rec's float depthwise Conv1D after the
-AveragePool (its input is not quantized in the export). On rec, the model
-input `quantize_affine + to_nhwc` and model output `dequantize_affine` are
-handled by `espdl_quant_s8` and `espdl_dequant_s8_f32`; the 2 remaining
-transposes wrap the unquantized float depthwise Conv1D.
+What stays with IREE: on rec, **nothing** (all 79 compute dispatches go to
+`esp-dl`, with 0 transposes and 0 IREE codegen dispatches). On det, Resize,
+Concat, MaxPool, and the two float `ConvTranspose` layers (lowered
+`InsertZeros`).
 
 `just esp-p4-kernel-test` checks the ESP32-P4 backend on a board. It takes
 every kernel configuration of both models (spatial sizes cropped), fills it
 with random data, computes the expected bytes with the reference kernels and
 builds `espdl/espdl_p4_test`, which runs the esp-dl backend and compares. On
-an ESP32-P4 rev 1.3 all 76 cases (55 convolutions, 17 Add/Mul, 4 LUT) are
-bit-exact. The firmware is an idf-next project: `idf.toml` sets the chip
-revision below 3.0 and a custom partition table, whose path is given
-relative to the project idf-next generates under `build/`.
+an ESP32-P4 rev 1.3 all 93 cases (56 convolutions, 16 average pools,
+17 Add/Mul, 4 LUT) are bit-exact. The firmware is an idf-next project:
+`idf.toml` sets the chip revision below 3.0 and a custom partition table,
+whose path is given relative to the project idf-next generates under
+`build/`.
 
 Known workarounds:
 
@@ -147,11 +152,13 @@ Measured on ESP32-P4 rev 1.3 @ 360 MHz (`firmware/rec_p4`), warm runs (run 1–2
 | Compiler `-O2` | ~456 ms | 265.9 ms | `COMPILER_OPTIMIZATION_PERF = true` in `rec_p4/idf.toml` |
 | Slab `calloc` bypass + setup elimination | 390.2 ms | 199.95 ms | `alloc` `19.64 -> 0.16 ms`; `conv/bin` setup `27.77 -> 1.56 ms` |
 | Boundary `quant_s8` + `dequant_s8_f32` | 376.3 ms | 185.4 ms | `quant` `10.84 -> 4.26 ms`; `dequant` `23.54 -> 15.49 ms` |
-| In-place LUT/binary + SRAM transient slab | **312.5 ms** | **132.5 ms** | Tied `lut_s8_ip`/`binary_s8_ip`; transient slab `596.9 -> 314.2 KB` in internal SRAM |
+| In-place LUT/binary + SRAM transient slab | 312.5 ms | 132.5 ms | Tied `lut_s8_ip`/`binary_s8_ip`; transient slab `596.9 -> 314.2 KB` in internal SRAM |
+| Tail-op takeover (`avg_pool2d_s8` + `Conv.35__1d`) | 303.9 ms | 124.0 ms | `iree_disp` `9.93 -> 0.00 ms` (`79/79` esp-dl, `0` transposes, `.text` `16 -> 2 KiB`) |
+| `esp-iree-p4` `-O3` (`Release`) | **303.9 ms** | **123.7 ms** | `justfile`: `-DCMAKE_BUILD_TYPE=Release`; `vm/hal` `9.99 -> 9.74 ms` |
 
-Total PSRAM-copy speedup: **-135.3 ms (-50.5%)**.
+Total PSRAM-copy speedup: **-144.1 ms (-53.8%)**.
 
-Details of the four optimizations:
+Details of the optimizations:
 
 1. **Skip PSRAM payload zero-fill in HAL heap slab allocator (`firmware/rec_p4/src/main.c`)**:
    `iree_hal_allocator_create_heap` zeroes ~1.88 MiB of temporary and output PSRAM buffers per run
@@ -186,13 +193,27 @@ Details of the four optimizations:
      `64 KiB` (`SRAM_RESERVE_BYTES`) of internal heap headroom, placing the entire `314,228 B`
      transient slab in internal SRAM (`178 KiB` free after alloc, `144 KiB` min free) while
      keeping the `1,105,140 B` external output buffer in PSRAM.
+5. **Take over remaining 6 IREE dispatches (`espdl_avg_pool2d_s8` + `Conv.35__1d` reshape unwrapping)**:
+   - `Conv.35__1d` (`3.09 ms`) was actually already `int8`-quantized (`i8 x i8 -> i32 -> i8`),
+     hidden behind unit-dim `tensor.collapse_shape` / `tensor.expand_shape` reshapes from the
+     `Conv1D` lowering; unwrapping those unit reshapes in `espdl_rewrite.py` routes it (and drops
+     the 2 surrounding `transpose` ops, `0.08 ms`) to `espdl_conv2d_s8`.
+   - Added `espdl_avg_pool2d_s8` to match both `linalg.pooling_nchw_sum + divf` (`AveragePool.0`,
+     `4.24 ms`) and global H/W `linalg.generic(addf) + divf` (3 SE reductions, `2.52 ms`), running
+     in `1.37 ms` via PIE `dl_esp32p4_s8_avg_pool2d_hwc_sum` + RV32F `fcvt.w.s ..., rne`.
+   - All 79 dispatches now run via `esp-dl` (`0.00 ms` IREE codegen, `rec.espdl.p4.o` `.text`
+     `16 -> 2 KiB`), placing the `314,676 B` transient slab in internal SRAM (`178 KiB` free,
+     `145 KiB` min free).
+6. **Compile IREE runtime with `-O3` (`justfile`)**:
+   - Switched `esp-iree-p4` from `-DCMAKE_BUILD_TYPE=MinSizeRel` (`-Os`) to `Release` (`-O3`),
+     trimming `vm/hal` from `9.99 ms` to `9.74 ms` (`rec_p4.bin` `3.94 -> 3.99 MiB`, 50% partition free).
 
-Warm PSRAM-copy breakdown (`132.5 ms`, run 2):
-- `espdl` dispatches (74 calls): `112.51 ms` (`conv2d_s8` 81.97 incl. 0.19 setup, `dequant_s8_f32`
-  13.37, `lut_s8_ip` 7.51 + `lut_s8` 2.89, `quant_s8` 3.96, `binary_s8_ip` 2.21 + `binary_s8` 0.61)
-- Remaining IREE dispatches (6 calls): `9.93 ms` (3 SE reductions 2.52, `pooling_nhwc_sum` 4.24,
-  float `depthwise_conv1d` 3.09, `transpose` 0.08)
-- IREE VM + HAL scheduling: `10.08 ms` (`alloc` `0.20 ms`, `12 alloc [1 sram, 1 psram]`)
+Warm PSRAM-copy breakdown (`123.7 ms`, run 2):
+- `espdl` dispatches (79 calls): `113.91 ms` (`conv2d_s8` 82.02 incl. 0.19 setup, `dequant_s8_f32`
+  13.32, `lut_s8_ip` 7.45 + `lut_s8` 2.93, `quant_s8` 3.97, `binary_s8_ip` 2.30 + `binary_s8` 0.56,
+  `avg_pool2d_s8` 1.37)
+- Remaining IREE dispatches (0 calls): `0.00 ms`
+- IREE VM + HAL scheduling: `9.74 ms` (`alloc` `0.21 ms`, `12 alloc [1 sram, 1 psram]`)
 
 For reference on the same ESP32-P4 rev 1.3 @ 360 MHz, Espressif's standalone `esp-dl 3.3.15`
 `dl::Model` running `rec.espdl` (`param_copy=true`, `1-core`) measures `131.4 ms` with `sram=0`

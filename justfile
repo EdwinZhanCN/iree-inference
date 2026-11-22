@@ -187,7 +187,7 @@ esp-p4-kernel-test: esp-venv esp-plugin
 # flatcc tool, so run `just iree` first.
 [doc("Cross-compile the IREE runtime for ESP32-P4 into third_party/iree-build-p4")]
 esp-iree-p4:
-    eval "$(idf env --shell)" && cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(root / "third_party" / "iree-build-p4") }} -DCMAKE_TOOLCHAIN_FILE={{ quote(esp_tools / "firmware" / "p4_toolchain.cmake") }} -DCMAKE_BUILD_TYPE=MinSizeRel -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_HOST_BIN_DIR={{ quote(iree_build / "tools") }}
+    eval "$(idf env --shell)" && cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(root / "third_party" / "iree-build-p4") }} -DCMAKE_TOOLCHAIN_FILE={{ quote(esp_tools / "firmware" / "p4_toolchain.cmake") }} -DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_HOST_BIN_DIR={{ quote(iree_build / "tools") }}
     ninja -C {{ quote(root / "third_party" / "iree-build-p4") }} iree_runtime_unified iree_hal_local_loaders_static_library_loader iree_hal_local_executable_library_util flatcc_parsing
 
 # Whole rec on the board: compares the output bytes with the host's and

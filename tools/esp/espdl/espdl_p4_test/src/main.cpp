@@ -21,6 +21,8 @@ static int run(const espdl_case_t* c, int8_t* y) {
       return espdl_p4_conv2d_s8(i8[0], i8[1], i32[2], i8[3], i32[4], y);
     case ESPDL_CASE_BINARY:
       return espdl_p4_binary_s8(i8[0], i8[1], i32[2], y);
+    case ESPDL_CASE_POOL:
+      return espdl_p4_avg_pool2d_s8(i8[0], i32[1], y);
     default:
       return espdl_p4_lut_s8(i8[0], i8[1], i32[2], y);
   }

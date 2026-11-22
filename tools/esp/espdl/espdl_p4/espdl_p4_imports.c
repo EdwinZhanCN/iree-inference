@@ -46,6 +46,14 @@ static int dequant_s8_f32(void* args, void* context, void* reserved) {
                                  a->y + a->y_offset);
 }
 
+static int avg_pool2d_s8(void* args, void* context, void* reserved) {
+  (void)context;
+  (void)reserved;
+  const espdl_avg_pool2d_s8_args_t* a = (const espdl_avg_pool2d_s8_args_t*)args;
+  return espdl_p4_avg_pool2d_s8(a->x + a->x_offset, a->params + a->params_offset,
+                                a->y + a->y_offset);
+}
+
 espdl_import_fn_t espdl_p4_lookup(const char* name) {
   static const struct {
     const char* name;
@@ -56,6 +64,7 @@ espdl_import_fn_t espdl_p4_lookup(const char* name) {
       {"espdl_binary_s8", binary_s8},
       {"espdl_quant_s8", quant_s8},
       {"espdl_dequant_s8_f32", dequant_s8_f32},
+      {"espdl_avg_pool2d_s8", avg_pool2d_s8},
   };
   for (size_t i = 0; i < sizeof(imports) / sizeof(imports[0]); ++i) {
     if (strcmp(name, imports[i].name) == 0) return imports[i].fn;

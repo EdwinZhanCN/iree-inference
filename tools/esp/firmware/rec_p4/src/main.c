@@ -80,7 +80,11 @@ static const iree_hal_executable_library_header_t** prof_library_query(
     iree_hal_executable_library_version_t max_version,
     const iree_hal_executable_environment_v0_t* environment) {
   const iree_hal_executable_library_header_t** hdr =
+#ifdef IREE_GENERATED_STATIC_EXECUTABLE_LIBRARY_ESPDL_EXECUTABLE_
+      espdl_executable_library_query(max_version, environment);
+#else
       rec_espdl_linked_library_query(max_version, environment);
+#endif
   if (!hdr) return NULL;
   g_orig_lib = (const iree_hal_executable_library_v0_t*)hdr;
   g_prof_lib = *g_orig_lib;
@@ -351,14 +355,15 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
       const int64_t total_us = t1 - t0;
       const int64_t espdl_us = st.conv_setup_us + st.conv_kernel_us + st.lut_us +
                                st.binary_setup_us + st.binary_kernel_us +
-                               st.quant_us + st.dequant_us;
+                               st.quant_us + st.dequant_us + st.pool_us;
       printf("run %d: total %lld ms (%lld us) | conv %lu (setup %.2f + kernel %.2f ms) | "
              "lut %lu (%.2f ms) | bin %lu (setup %.2f + kernel %.2f ms) | "
-             "q %lu (%.2f ms) | dq %lu (%.2f ms) | iree/other %.2f ms\n",
+             "pool %lu (%.2f ms) | q %lu (%.2f ms) | dq %lu (%.2f ms) | iree/other %.2f ms\n",
              r, total_us / 1000, total_us,
              (unsigned long)st.conv_calls, st.conv_setup_us / 1000.0, st.conv_kernel_us / 1000.0,
              (unsigned long)st.lut_calls, st.lut_us / 1000.0,
              (unsigned long)st.binary_calls, st.binary_setup_us / 1000.0, st.binary_kernel_us / 1000.0,
+             (unsigned long)st.pool_calls, st.pool_us / 1000.0,
              (unsigned long)st.quant_calls, st.quant_us / 1000.0,
              (unsigned long)st.dequant_calls, st.dequant_us / 1000.0,
              (total_us - espdl_us) / 1000.0);
@@ -374,7 +379,8 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
                                  strcmp(name, "binary_s8") == 0 ||
                                  strcmp(name, "binary_s8_ip") == 0 ||
                                  strcmp(name, "quant_s8") == 0 ||
-                                 strcmp(name, "dequant_s8_f32") == 0);
+                                 strcmp(name, "dequant_s8_f32") == 0 ||
+                                 strcmp(name, "avg_pool2d_s8") == 0);
           if (is_espdl) sum_espdl_disp_ms += ms;
           else sum_iree_disp_ms += ms;
           printf("  dispatch[%2lu] %7.2f ms (%3lu calls, %5lu wgs) %s\n",

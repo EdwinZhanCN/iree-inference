@@ -142,3 +142,34 @@ int espdl_ref_dequant_s8_f32(const int8_t* x, const int32_t* p, float* y) {
   }
   return ESPDL_OK;
 }
+
+int espdl_ref_avg_pool2d_s8(const int8_t* x, const int32_t* p, int8_t* y) {
+  const int32_t H = p[ESPDL_POOL_H], W = p[ESPDL_POOL_W], C = p[ESPDL_POOL_C];
+  const int32_t KH = p[ESPDL_POOL_KH], KW = p[ESPDL_POOL_KW];
+  const int32_t SH = p[ESPDL_POOL_SH], SW = p[ESPDL_POOL_SW];
+  const int32_t OH = p[ESPDL_POOL_OH], OW = p[ESPDL_POOL_OW];
+  const int x_exp = p[ESPDL_POOL_X_EXP], y_exp = p[ESPDL_POOL_Y_EXP];
+  if (H <= 0 || W <= 0 || C <= 0 || KH <= 0 || KW <= 0 || SH <= 0 || SW <= 0 ||
+      KH > H || KW > W || OH != (H - KH) / SH + 1 || OW != (W - KW) / SW + 1) {
+    return ESPDL_ERR_SHAPE;
+  }
+  const float area = (float)((int64_t)KH * KW);
+  const float scale = ldexpf(1.0f, x_exp - y_exp);
+  for (int32_t oh = 0; oh < OH; ++oh) {
+    for (int32_t ow = 0; ow < OW; ++ow) {
+      int8_t* yp = y + ((int64_t)oh * OW + ow) * C;
+      for (int32_t c = 0; c < C; ++c) {
+        int32_t sum = 0;
+        for (int32_t kh = 0; kh < KH; ++kh) {
+          const int32_t ih = oh * SH + kh;
+          for (int32_t kw = 0; kw < KW; ++kw) {
+            const int32_t iw = ow * SW + kw;
+            sum += x[((int64_t)ih * W + iw) * C + c];
+          }
+        }
+        yp[c] = quant_rne_s8((float)sum / area, scale);
+      }
+    }
+  }
+  return ESPDL_OK;
+}

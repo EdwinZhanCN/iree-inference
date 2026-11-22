@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "dl_base_add.hpp"
+#include "dl_base_avg_pool2d.hpp"
+#include "dl_base_isa.hpp"
 #include "dl_base_conv2d.hpp"
 #include "dl_base_conv_args.hpp"
 #include "dl_base_conv_select.hpp"
@@ -352,5 +354,89 @@ extern "C" int espdl_p4_dequant_s8_f32(const int8_t* x, const int32_t* p, float*
   const int64_t t1 = esp_timer_get_time();
   ++g_stats.dequant_calls;
   g_stats.dequant_us += (t1 - t0);
+  return ESPDL_OK;
+}
+
+extern "C" int espdl_p4_avg_pool2d_s8(const int8_t* x, const int32_t* p, int8_t* y) {
+  const int64_t t0 = esp_timer_get_time();
+  const int32_t H = p[ESPDL_POOL_H], W = p[ESPDL_POOL_W], C = p[ESPDL_POOL_C];
+  const int32_t KH = p[ESPDL_POOL_KH], KW = p[ESPDL_POOL_KW];
+  const int32_t SH = p[ESPDL_POOL_SH], SW = p[ESPDL_POOL_SW];
+  const int32_t OH = p[ESPDL_POOL_OH], OW = p[ESPDL_POOL_OW];
+  const int x_exp = p[ESPDL_POOL_X_EXP], y_exp = p[ESPDL_POOL_Y_EXP];
+  if (H <= 0 || W <= 0 || C <= 0 || KH <= 0 || KW <= 0 || SH <= 0 || SW <= 0 ||
+      KH > H || KW > W || OH != (H - KH) / SH + 1 || OW != (W - KW) / SW + 1) {
+    return ESPDL_ERR_SHAPE;
+  }
+  const float area = static_cast<float>(static_cast<int64_t>(KH) * KW);
+  const float scale = ldexpf(1.0f, x_exp - y_exp);
+
+#if CONFIG_PIE_V2_BOOST
+  if ((C % 16) == 0 && (reinterpret_cast<uintptr_t>(x) & 15u) == 0) {
+    alignas(16) int32_t stack_buf[256];
+    int32_t* buf = stack_buf;
+    int32_t* heap_buf = nullptr;
+    if (C > 256) {
+      heap_buf = static_cast<int32_t*>(
+          heap_caps_aligned_alloc(16, static_cast<size_t>(C) * sizeof(int32_t), MALLOC_CAP_8BIT));
+      if (!heap_buf) return ESPDL_ERR_UNSUPPORTED;
+      buf = heap_buf;
+    }
+    dl::base::PoolArgsType<int8_t> args{};
+    args.input_y_offset_bytes = W * C;
+    args.input_x_offset_bytes = C;
+    args.filter_height = KH;
+    args.filter_width = KW;
+    args.c_div_x_1 = C / 16 - 1;
+    args.c_remainder = 0;
+
+    for (int32_t oh = 0; oh < OH; ++oh) {
+      for (int32_t ow = 0; ow < OW; ++ow) {
+        const int8_t* in_px = x + (static_cast<size_t>(oh) * SH * W + static_cast<size_t>(ow) * SW) * C;
+        int8_t* yp = y + (static_cast<size_t>(oh) * OW + ow) * C;
+        dl_esp32p4_s8_avg_pool2d_hwc_sum(buf, const_cast<int8_t*>(in_px), &args);
+        if ((reinterpret_cast<uintptr_t>(yp) & 3u) == 0) {
+          uint32_t* out_w = reinterpret_cast<uint32_t*>(yp);
+          for (int32_t c = 0; c < C; c += 4) {
+            const uint32_t q0 = static_cast<uint8_t>(quant_rne_s8(static_cast<float>(buf[c + 0]) / area, scale));
+            const uint32_t q1 = static_cast<uint8_t>(quant_rne_s8(static_cast<float>(buf[c + 1]) / area, scale));
+            const uint32_t q2 = static_cast<uint8_t>(quant_rne_s8(static_cast<float>(buf[c + 2]) / area, scale));
+            const uint32_t q3 = static_cast<uint8_t>(quant_rne_s8(static_cast<float>(buf[c + 3]) / area, scale));
+            *out_w++ = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+          }
+        } else {
+          for (int32_t c = 0; c < C; ++c) {
+            yp[c] = quant_rne_s8(static_cast<float>(buf[c]) / area, scale);
+          }
+        }
+      }
+    }
+    if (heap_buf) heap_caps_free(heap_buf);
+    const int64_t t1 = esp_timer_get_time();
+    ++g_stats.pool_calls;
+    g_stats.pool_us += (t1 - t0);
+    return ESPDL_OK;
+  }
+#endif
+
+  for (int32_t oh = 0; oh < OH; ++oh) {
+    for (int32_t ow = 0; ow < OW; ++ow) {
+      int8_t* yp = y + (static_cast<size_t>(oh) * OW + ow) * C;
+      for (int32_t c = 0; c < C; ++c) {
+        int32_t sum = 0;
+        for (int32_t kh = 0; kh < KH; ++kh) {
+          const int32_t ih = oh * SH + kh;
+          for (int32_t kw = 0; kw < KW; ++kw) {
+            const int32_t iw = ow * SW + kw;
+            sum += x[(static_cast<size_t>(ih) * W + iw) * C + c];
+          }
+        }
+        yp[c] = quant_rne_s8(static_cast<float>(sum) / area, scale);
+      }
+    }
+  }
+  const int64_t t1 = esp_timer_get_time();
+  ++g_stats.pool_calls;
+  g_stats.pool_us += (t1 - t0);
   return ESPDL_OK;
 }

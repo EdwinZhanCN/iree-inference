@@ -38,9 +38,10 @@ import sys
 import numpy as np
 from iree.compiler import ir
 
-# Field order of espdl_ref.h's ESPDL_CONV_* parameters.
+# Field order of espdl_ref.h's ESPDL_CONV_* and ESPDL_POOL_* parameters.
 PARAMS = ["H", "W", "C", "O", "KH", "KW", "SH", "SW", "PT", "PL", "PB", "PR",
           "DH", "DW", "G", "OH", "OW", "RELU", "X_EXP", "Y_EXP"]
+POOL_PARAMS = ["H", "W", "C", "KH", "KW", "SH", "SW", "OH", "OW", "X_EXP", "Y_EXP"]
 
 
 class Skip(Exception):
@@ -132,8 +133,27 @@ def exponent(scale):
 
 # ---- Matching -------------------------------------------------------------------
 
-def match_input(value):
-    """x int8 value and its exponent, and pads (top, left, bottom, right)."""
+def unwrap_unit_reshapes(value):
+    """Strip tensor.expand_shape / tensor.collapse_shape that only add/remove
+    unit spatial dims while preserving batch=1 and channel dim 1."""
+    while True:
+        op = producer(value)
+        if op.name not in ("tensor.expand_shape", "tensor.collapse_shape"):
+            return value
+        src = op.operands[0]
+        s, ss = shape(value), shape(src)
+        if len(s) < 3 or len(ss) < 3 or s[0] != 1 or ss[0] != 1 or s[1] != ss[1]:
+            return value
+        if int(np.prod(s[2:])) != int(np.prod(ss[2:])):
+            return value
+        # Require at least one of (H, W) to be 1 in 4D so spatial order is trivial.
+        if (len(s) == 4 and 1 not in s[2:]) or (len(ss) == 4 and 1 not in ss[2:]):
+            return value
+        value = src
+
+
+def match_input(value, allow_unit_reshape=False):
+    """x int8 value, its exponent, pads (top, left, bottom, right), and unpadded shape."""
     pads = [0, 0, 0, 0]
     op = producer(value)
     if op.name == "tensor.pad":
@@ -146,10 +166,13 @@ def match_input(value):
         sp = len(low) - 2
         pads = [low[2], low[3], high[2], high[3]] if sp == 2 else [0, low[2], 0, high[2]]
         value = op.operands[0]
+    unpadded_shape = shape(value)
+    if allow_unit_reshape:
+        value = unwrap_unit_reshapes(value)
     xq, sx = dequant(value)
     if sx.ndim != 0:
         raise Skip("per-channel input scale")
-    return xq, int(exponent(sx)), pads
+    return xq, int(exponent(sx)), pads, unpadded_shape
 
 
 def match_bias(init, out_channels, channel_dim):
@@ -180,33 +203,55 @@ def match(q):
     y_exp = int(exponent(sy))
 
     relu = False
+    collapse_out = False
     op = producer(q.operands[0])
+    if op.name == "tensor.collapse_shape":
+        qs = shape(q.results[0])
+        ss = shape(op.operands[0])
+        if len(qs) == 3 and len(ss) == 4 and qs[0] == 1 and ss[0] == 1 and qs[1] == ss[1] \
+                and 1 in ss[2:] and ss[2] * ss[3] == qs[2]:
+            collapse_out = True
+            op = producer(op.operands[0])
     if is_relu(op):
         relu = True
         op = producer(op.operands[0])
 
-    m = {"kind": "conv", "op": op.name.split(".")[-1], "relu": relu, "y_exp": y_exp, "y_type": q.results[0].type}
+    m = {"kind": "conv", "op": op.name.split(".")[-1], "relu": relu,
+         "collapse_out": collapse_out, "y_exp": y_exp, "y_type": q.results[0].type}
     if op.name in ("linalg.conv_2d_nchw_fchw", "linalg.depthwise_conv_2d_nchw_chw",
                    "linalg.conv_1d_ncw_fcw"):
         strides = [int(v) for v in np.array(op.attributes["strides"]).reshape(-1)]
         dilations = [int(v) for v in np.array(op.attributes["dilations"]).reshape(-1)]
-        xq, x_exp, pads = match_input(op.operands[0])
+        allow_ur = (op.name == "linalg.depthwise_conv_2d_nchw_chw")
+        xq, x_exp, pads, unpadded_shape = match_input(op.operands[0], allow_unit_reshape=allow_ur)
         x_shape = shape(xq)
-        if x_shape[0] != 1:
+        if x_shape[0] != 1 or unpadded_shape[0] != 1:
             raise Skip("batch != 1")
         wv = op.operands[1]
         if op.name == "linalg.depthwise_conv_2d_nchw_chw":
             wv = producer(wv, "tensor.collapse_shape").operands[0]
+            if producer(wv).name == "tensor.expand_shape":
+                ws = shape(wv)
+                src_ws = shape(producer(wv).operands[0])
+                if len(ws) == 4 and len(src_ws) == 3 and ws[0] == src_ws[0] and ws[1] == src_ws[1] \
+                        and 1 in ws[2:] and ws[2] * ws[3] == src_ws[2]:
+                    wv = producer(wv).operands[0]
         wq, sw = dequant(wv)
         w = const(wq)  # (O, C/G, KH, KW) or (O, C/G, K)
+        if op.name == "linalg.depthwise_conv_2d_nchw_chw" and w.ndim == 3:
+            # 1D depthwise weight [O, 1, K] expanded to [O, 1, KH, KW] matching spatial shape.
+            if unpadded_shape[3] == 1:
+                w = w[:, :, :, None]
+            else:
+                w = w[:, :, None, :]
         O = w.shape[0]
         if op.name == "linalg.conv_1d_ncw_fcw":
-            C, H, W = x_shape[1], 1, x_shape[2]
+            C, H, W = unpadded_shape[1], 1, unpadded_shape[2]
             w = w[:, :, None, :]
             strides, dilations = [1, strides[0]], [1, dilations[0]]
             in_perm, out_perm, out_rank = [0, 2, 1], [0, 2, 1], 3
         else:
-            C, H, W = x_shape[1], x_shape[2], x_shape[3]
+            C, H, W = unpadded_shape[1], unpadded_shape[2], unpadded_shape[3]
             in_perm, out_perm, out_rank = [0, 2, 3, 1], [0, 3, 1, 2], 4
         G = C if op.name == "linalg.depthwise_conv_2d_nchw_chw" else 1
         if w.shape[1] * G != C:
@@ -251,6 +296,8 @@ def match(q):
                  sw=np.broadcast_to(sw, (N,)), bias=None, b_exp=None)
     else:
         raise Skip(f"producer {op.name}")
+    if collapse_out and op.name != "linalg.depthwise_conv_2d_nchw_chw":
+        raise Skip("unexpected collapse")
 
     m["OH"] = (m["H"] + m["PT"] + m["PB"] - m["DH"] * (m["KH"] - 1) - 1) // m["SH"] + 1
     m["OW"] = (m["W"] + m["PL"] + m["PR"] - m["DW"] * (m["KW"] - 1) - 1) // m["SW"] + 1
@@ -271,6 +318,92 @@ def match(q):
     m["x_shape"] = shape(m["xq"])
     m["X_EXP"], m["Y_EXP"], m["RELU"] = m["x_exp"], m["y_exp"], int(m["relu"])
     return m
+
+
+# ---- AveragePool / ReduceMean --------------------------------------------------
+
+def match_pool(q):
+    """dequantize_affine(x) -> (pooling_nchw_sum | H/W sum generic) -> divf(area)
+    -> quantize_affine: espdl_avg_pool2d_s8."""
+    y_exp = scalar_exp(q)
+    div_op = producer(q.operands[0], "linalg.generic")
+    if len(div_op.operands) != 2 or len(div_op.results) != 1:
+        raise Skip("pool div operands")
+    if not all("parallel" in str(t) for t in ir.ArrayAttr(div_op.attributes["iterator_types"])):
+        raise Skip("pool div iterators")
+    div_maps = [map_kind(a) for a in ir.ArrayAttr(div_op.attributes["indexing_maps"])]
+    if div_maps != ["id", "id"]:
+        raise Skip("pool div maps")
+    div_body = [o.operation for o in div_op.regions[0].blocks[0].operations]
+    if [o.name for o in div_body] != ["arith.divf", "linalg.yield"]:
+        raise Skip("pool div body")
+    bargs = div_op.regions[0].blocks[0].arguments
+    if div_body[0].operands[0] != bargs[0]:
+        raise Skip("pool div lhs")
+    area_f = float(const(div_body[0].operands[1]))
+
+    sum_op = producer(div_op.operands[0])
+    if sum_op.name == "linalg.pooling_nchw_sum":
+        if i64_array(sum_op, "dilations") != [1, 1]:
+            raise Skip("pool dilations")
+        strides = i64_array(sum_op, "strides")
+        fill = producer(sum_op.operands[2], "linalg.fill")
+        if float(const(fill.operands[0])) != 0.0:
+            raise Skip("pool fill not 0")
+        xq, x_exp, pads, _ = match_input(sum_op.operands[0])
+        if any(pads):
+            raise Skip("pool padding")
+        xs = shape(xq)
+        if len(xs) != 4 or xs[0] != 1:
+            raise Skip("pool shape")
+        _, C, H, W = xs
+        ws = shape(sum_op.operands[1])
+        KH, KW = ws[0], ws[1]
+        SH, SW = strides[0], strides[1]
+    elif sum_op.name == "linalg.generic":
+        if len(sum_op.operands) != 2 or len(sum_op.results) != 1:
+            raise Skip("reduce operands")
+        iters = [str(t) for t in ir.ArrayAttr(sum_op.attributes["iterator_types"])]
+        if len(iters) != 4 or "parallel" not in iters[0] or "parallel" not in iters[1] \
+                or "reduction" not in iters[2] or "reduction" not in iters[3]:
+            raise Skip("reduce iterators")
+        maps = [ir.AffineMapAttr(a).value for a in ir.ArrayAttr(sum_op.attributes["indexing_maps"])]
+        if len(maps) != 2 or map_kind(ir.ArrayAttr(sum_op.attributes["indexing_maps"])[0]) != "id":
+            raise Skip("reduce in map")
+        if [str(r) for r in maps[1].results] != ["d0", "d1", "0", "0"]:
+            raise Skip("reduce out map")
+        body = [o.operation for o in sum_op.regions[0].blocks[0].operations]
+        if [o.name for o in body] != ["arith.addf", "linalg.yield"]:
+            raise Skip("reduce body")
+        rargs = sum_op.regions[0].blocks[0].arguments
+        if set(body[0].operands) != {rargs[0], rargs[1]}:
+            raise Skip("reduce addf operands")
+        fill = producer(sum_op.operands[1], "linalg.fill")
+        if float(const(fill.operands[0])) != 0.0:
+            raise Skip("reduce fill not 0")
+        xq, sx = dequant(sum_op.operands[0])
+        if sx.ndim != 0:
+            raise Skip("per-channel input scale")
+        x_exp = int(exponent(sx))
+        xs = shape(xq)
+        if len(xs) != 4 or xs[0] != 1:
+            raise Skip("reduce shape")
+        _, C, H, W = xs
+        KH, KW, SH, SW = H, W, 1, 1
+    else:
+        raise Skip(f"pool sum producer {sum_op.name}")
+
+    if KH > H or KW > W or abs(area_f - KH * KW) > 1e-3:
+        raise Skip("pool area mismatch")
+    OH = (H - KH) // SH + 1
+    OW = (W - KW) // SW + 1
+    return {
+        "kind": "pool", "op": "avg_pool", "xq": xq,
+        "x_exp": x_exp, "y_exp": y_exp, "y_type": q.results[0].type,
+        "H": H, "W": W, "C": C, "KH": KH, "KW": KW, "SH": SH, "SW": SW,
+        "OH": OH, "OW": OW, "X_EXP": x_exp, "Y_EXP": y_exp,
+        "k_in_shape": [1, H, W, C], "k_shape": [1, OH, OW, C],
+    }
 
 
 # ---- Unary and binary elementwise ----------------------------------------------
@@ -486,6 +619,7 @@ IMPORTS = {
     "binary_s8": [("a", "i8"), ("b", "i8"), ("params", "i32"), ("y", "i8")],
     "quant_s8": [("x", "f32"), ("params", "i32"), ("y", "i8")],
     "dequant_s8_f32": [("x", "i8"), ("params", "i32"), ("y", "f32")],
+    "avg_pool2d_s8": [("x", "i8"), ("params", "i32"), ("y", "i8")],
 }
 
 
@@ -589,6 +723,10 @@ def emit_func(name, m):
         params = np.array(m["params"], dtype=np.int32)
         return emit_dispatch(name, "dequant_s8_f32", [m["in_shape"]], [(params, "i32")],
                              m["out_shape"], arg_elems=["i8"], out_elem="f32")
+    if m["kind"] == "pool":
+        params = np.array([m[k] for k in POOL_PARAMS], dtype=np.int32)
+        return emit_dispatch(name, "avg_pool2d_s8", [m["k_in_shape"]], [(params, "i32")],
+                             m["k_shape"])
     params = np.array(m["params"], dtype=np.int32)
     return emit_dispatch(name, "binary_s8", [m["k_a_shape"], m["k_b_shape"]],
                          [(params, "i32")], m["k_shape"], inplace=m.get("inplace", False))
@@ -658,6 +796,37 @@ class Layout:
             self.nhwc[value] = self.transpose(value, PERM[len(shape(value))], "to_nhwc")
         return self.nhwc[value]
 
+    def reshape_unit(self, value, target_shape):
+        """Zero-cost spatial unit-dim collapse/expand in channels-last layout."""
+        t = ir.RankedTensorType(value.type)
+        src_shape = list(t.shape)
+        if src_shape == target_shape:
+            return value
+        elem = str(t.element_type)
+        dst_t = ir.RankedTensorType.get(target_shape, t.element_type)
+        name = ("espdl_ur_" + "x".join(map(str, src_shape)) + "_to_" +
+                "x".join(map(str, target_shape)) + f"x{elem}")
+        if name not in self.helpers:
+            src_s, dst_s = str(t), str(dst_t)
+            if len(src_shape) == 4 and len(target_shape) == 4:
+                mid_s = f"tensor<{src_shape[0]}x{src_shape[1] * src_shape[2]}x{src_shape[3]}x{elem}>"
+                body = [
+                    f"  %m = tensor.collapse_shape %x [[0], [1, 2], [3]] : {src_s} into {mid_s}",
+                    f"  %y = tensor.expand_shape %m [[0], [1, 2], [3]] output_shape [{', '.join(map(str, target_shape))}] : {mid_s} into {dst_s}",
+                ]
+            elif len(src_shape) == 4 and len(target_shape) == 3:
+                body = [f"  %y = tensor.collapse_shape %x [[0], [1, 2], [3]] : {src_s} into {dst_s}"]
+            elif len(src_shape) == 3 and len(target_shape) == 4:
+                body = [f"  %y = tensor.expand_shape %x [[0], [1, 2], [3]] output_shape [{', '.join(map(str, target_shape))}] : {src_s} into {dst_s}"]
+            else:
+                raise AssertionError(f"unsupported unit reshape {src_shape} -> {target_shape}")
+            self.helpers[name] = "\n".join([
+                f"util.func private @{name}(%x: {src_s}) -> {dst_s} {{",
+                *body,
+                f"  util.return %y : {dst_s}",
+                "}"])
+        return self.call(name, value, dst_t)
+
     def kernel(self, q, m, name):
         """Replace quantize q by kernel call name. Returns False if the
         operands' layouts do not fit the kernel."""
@@ -665,12 +834,23 @@ class Layout:
         if m["kind"] == "conv":
             x = m["xq"]
             kin = self.to_nhwc(x) if m["in_perm"] else x
+            if shape(kin) != m["k_in_shape"]:
+                kin = self.reshape_unit(kin, m["k_in_shape"])
             y = self.call(name, [kin], ir.RankedTensorType.get(m["k_shape"], i8))
-            if m["out_perm"]:
+            if m.get("collapse_out"):
+                y_nhwc = self.reshape_unit(y, [1, m["OH"] * m["OW"], m["O"]])
+                self.nhwc[q.results[0]] = y_nhwc
+                self.pending.append((q, y_nhwc, None))
+            elif m["out_perm"]:
                 self.nhwc[q.results[0]] = y
                 self.pending.append((q, y, None))
             else:
                 self.pending.append((q, None, y))
+            return True
+        if m["kind"] == "pool":
+            kin = self.to_nhwc(m["xq"])
+            y = self.call(name, [kin], ir.RankedTensorType.get(m["k_shape"], i8))
+            self.record(q, y, True)
             return True
         if m["kind"] == "lut":
             x = m["xq"]
@@ -961,7 +1141,7 @@ def main():
             if op.name != "iree_linalg_ext.quantize_affine":
                 continue
             reasons = []
-            for matcher in (match, match_unary, match_binary):
+            for matcher in (match, match_pool, match_unary, match_binary):
                 try:
                     matches.append((op, matcher(op)))
                     break
@@ -971,7 +1151,10 @@ def main():
                 skipped[reasons[0]] = skipped.get(reasons[0], 0) + 1
         for _, m in matches:
             if m["kind"] == "conv":
-                m["k_in_shape"] = [m["x_shape"][p] for p in m["in_perm"]] if m["in_perm"] else m["x_shape"]
+                if m["in_perm"]:
+                    m["k_in_shape"] = [1, m["H"], m["W"], m["C"]] if len(m["in_perm"]) == 4 else [1, m["W"], m["C"]]
+                else:
+                    m["k_in_shape"] = m["x_shape"]
                 m["k_shape"] = [1, m["OH"], m["OW"], m["O"]] if m["out_rank"] == 4 else [1, m["OW"], m["O"]]
         evaluate_luts([m for _, m in matches if m["kind"] == "lut"])
 
@@ -1012,7 +1195,8 @@ def main():
             if m["kind"] in ("lut", "binary") and name in single_use_arg0:
                 m["inplace"] = True
         kind_to_imp = {"conv": "conv2d_s8", "lut": "lut_s8", "binary": "binary_s8",
-                       "quant": "quant_s8", "dequant": "dequant_s8_f32"}
+                       "quant": "quant_s8", "dequant": "dequant_s8_f32",
+                       "pool": "avg_pool2d_s8"}
         used = sorted({
             kind_to_imp[m["kind"]] + ("_ip" if m.get("inplace") else "")
             for _, m in live

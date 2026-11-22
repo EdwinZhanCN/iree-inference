@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-enum { ESPDL_CASE_CONV, ESPDL_CASE_BINARY, ESPDL_CASE_LUT };
+enum { ESPDL_CASE_CONV, ESPDL_CASE_BINARY, ESPDL_CASE_LUT, ESPDL_CASE_POOL };
 
 typedef struct {
   const char* name;

@@ -23,26 +23,32 @@ BIN_ROWS = 5           # rows of binary cases: n = rows * b_len (b_len = n for s
 
 
 def collect(paths):
-    convs, binaries = {}, {}
+    convs, binaries, pools = {}, {}, {}
     for path in paths:
         with ir.Context(), ir.Location.unknown():
             module = ir.Module.parse(open(path).read())
             for op in R.walk(module.operation):
                 if op.name != "iree_linalg_ext.quantize_affine":
                     continue
-                try:
-                    m = R.match(op)
-                except R.Skip:
+                m = None
+                for matcher in (R.match, R.match_pool, R.match_binary):
                     try:
-                        m = R.match_binary(op)
+                        m = matcher(op)
+                        break
                     except R.Skip:
                         continue
+                if m is None:
+                    continue
                 if m["kind"] == "conv":
                     key = tuple(m[k] for k in ("C", "O", "KH", "KW", "SH", "SW", "PT", "PL", "PB",
                                                 "PR", "DH", "DW", "G", "RELU"))
                     if key not in convs:
                         convs[key] = {k: m[k] for k in R.PARAMS if k in m} | {
                             "w_exp": m["w_exp"].copy(), "H": m["H"], "W": m["W"]}
+                elif m["kind"] == "pool":
+                    key = (m["C"], m["KH"], m["KW"], m["SH"], m["SW"], m["X_EXP"], m["Y_EXP"])
+                    if key not in pools:
+                        pools[key] = {k: m[k] for k in R.POOL_PARAMS}
                 else:
                     rank = len(m["a_shape"])
                     full = m["b_full"] == m["a_shape"]
@@ -51,7 +57,7 @@ def collect(paths):
                     if key not in binaries:
                         binaries[key] = {"op": m["op"], "ea": m["ea"], "eb": m["eb"], "ey": m["ey"],
                                          "full": full, "bl": bl, "rank": rank}
-    return list(convs.values()), list(binaries.values())
+    return list(convs.values()), list(binaries.values()), list(pools.values())
 
 
 def conv_case(c, lib):
@@ -96,6 +102,27 @@ def binary_case(b, lib):
     return name, "binary", [a, bb, params], y
 
 
+def pool_case(p0, lib):
+    p = dict(p0)
+    # Keep global pools (KH == H, KW == W) global after shrinking large spatial dims.
+    if p["KH"] == p["H"] and p["KW"] == p["W"]:
+        p["H"] = p["KH"] = min(p["H"], MAX_H)
+        p["W"] = p["KW"] = min(p["W"], 23 if p["W"] >= 23 and (p["W"] % 2) else MAX_W)
+        p["OH"], p["OW"] = 1, 1
+    else:
+        p["H"] = max(min(p["H"], MAX_H), p["KH"])
+        p["W"] = max(min(p["W"], MAX_W), p["KW"])
+        p["OH"] = (p["H"] - p["KH"]) // p["SH"] + 1
+        p["OW"] = (p["W"] - p["KW"]) // p["SW"] + 1
+    x = RNG.integers(-128, 128, (p["H"], p["W"], p["C"]), dtype=np.int8)
+    params = np.array([p[k] for k in R.POOL_PARAMS], dtype=np.int32)
+    y = np.zeros(p["OH"] * p["OW"] * p["C"], dtype=np.int8)
+    rc = lib.espdl_ref_avg_pool2d_s8(ptr(x), ptr(params), ptr(y))
+    assert rc == 0, rc
+    name = f"pool C{p['C']} {p['H']}x{p['W']} k{p['KH']}x{p['KW']} s{p['SH']}x{p['SW']}"
+    return name, "pool", [x, params], y
+
+
 def lut_case(n, lib):
     x = RNG.integers(-128, 128, n, dtype=np.int8)
     table = RNG.integers(-128, 128, 256, dtype=np.int8)
@@ -118,8 +145,9 @@ def c_array(name, a):
 def main():
     lib = ctypes.CDLL(sys.argv[1])
     out, paths = sys.argv[2], sys.argv[3:]
-    convs, binaries = collect(paths)
+    convs, binaries, pools = collect(paths)
     cases = [conv_case(c, lib) for c in convs]
+    cases += [pool_case(p, lib) for p in pools]
     cases += [binary_case(b, lib) for b in binaries]
     cases += [lut_case(n, lib) for n in (1, 15, 16, 1000)]
 
@@ -139,7 +167,7 @@ def main():
               f"const int espdl_case_count = {len(cases)};", ""]
     with open(out, "w") as f:
         f.write("\n".join(lines))
-    print(f"{len(convs)} conv, {len(binaries)} binary, 4 lut cases -> {out}")
+    print(f"{len(convs)} conv, {len(pools)} pool, {len(binaries)} binary, 4 lut cases -> {out}")
 
 
 if __name__ == "__main__":
