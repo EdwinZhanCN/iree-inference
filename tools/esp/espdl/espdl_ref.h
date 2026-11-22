@@ -1,4 +1,5 @@
 // Reference implementations of the esp-dl kernels that IREE dispatches call.
+// Each takes its tensors, then an int32 parameter array.
 //
 // Quantization follows esp-dl on ESP32-P4: int8 values, symmetric (zero point
 // 0), every scale a power of two (real = q * 2^exp), per-channel weight
@@ -58,6 +59,30 @@ enum {
 //   y:     int8  [OH][OW][O]           scale 2^y_exp
 int espdl_ref_conv2d_s8(const int8_t* x, const int8_t* w, const int32_t* bias,
                         const int8_t* w_exp, const int32_t* params, int8_t* y);
+
+// Table lookup, as esp-dl's LUT: y[i] = table[x[i] + 128]. The table holds
+// a whole int8 -> int8 elementwise chain (activation, requantization).
+//
+//   params: { n }
+int espdl_ref_lut_s8(const int8_t* x, const int8_t* table, const int32_t* params,
+                     int8_t* y);
+
+// Parameters of espdl_ref_binary_s8.
+enum {
+  ESPDL_BINARY_N = 0,   // elements of a and y
+  ESPDL_BINARY_B_LEN,   // elements of b: b repeats every B_LEN elements of a
+  ESPDL_BINARY_OP,      // ESPDL_BINARY_ADD or ESPDL_BINARY_MUL
+  ESPDL_BINARY_A_EXP,   // scales 2^a_exp, 2^b_exp, 2^y_exp
+  ESPDL_BINARY_B_EXP,
+  ESPDL_BINARY_Y_EXP,
+  ESPDL_BINARY_PARAM_COUNT,
+};
+enum { ESPDL_BINARY_ADD = 0, ESPDL_BINARY_MUL = 1 };
+
+// y[i] = a[i] (+|*) b[i % B_LEN], computed exactly and rounded half to even
+// into y's scale. With power-of-two scales this is what float QDQ computes.
+int espdl_ref_binary_s8(const int8_t* a, const int8_t* b, const int32_t* params,
+                        int8_t* y);
 
 #ifdef __cplusplus
 }

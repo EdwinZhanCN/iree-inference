@@ -59,3 +59,35 @@ int espdl_ref_conv2d_s8(const int8_t* x, const int8_t* w, const int32_t* bias,
   }
   return ESPDL_OK;
 }
+
+int espdl_ref_lut_s8(const int8_t* x, const int8_t* table, const int32_t* p,
+                     int8_t* y) {
+  const int32_t n = p[0];
+  if (n < 0) return ESPDL_ERR_SHAPE;
+  for (int32_t i = 0; i < n; ++i) y[i] = table[(uint8_t)x[i] ^ 0x80u];
+  return ESPDL_OK;
+}
+
+int espdl_ref_binary_s8(const int8_t* a, const int8_t* b, const int32_t* p,
+                        int8_t* y) {
+  const int32_t n = p[ESPDL_BINARY_N], bl = p[ESPDL_BINARY_B_LEN];
+  const int32_t op = p[ESPDL_BINARY_OP];
+  const int ea = p[ESPDL_BINARY_A_EXP], eb = p[ESPDL_BINARY_B_EXP];
+  const int ey = p[ESPDL_BINARY_Y_EXP];
+  if (n < 0 || bl <= 0 || n % bl || (op != ESPDL_BINARY_ADD && op != ESPDL_BINARY_MUL)) {
+    return ESPDL_ERR_SHAPE;
+  }
+  if (op == ESPDL_BINARY_ADD) {
+    // a * 2^ea + b * 2^eb = (a * 2^(ea-m) + b * 2^(eb-m)) * 2^m, m = min.
+    const int m = ea < eb ? ea : eb;
+    const int64_t fa = (int64_t)1 << (ea - m), fb = (int64_t)1 << (eb - m);
+    for (int32_t i = 0; i < n; ++i) {
+      y[i] = saturate_s8(requantize(a[i] * fa + b[i % bl] * fb, ey - m));
+    }
+  } else {
+    for (int32_t i = 0; i < n; ++i) {
+      y[i] = saturate_s8(requantize((int64_t)a[i] * b[i % bl], ey - ea - eb));
+    }
+  }
+  return ESPDL_OK;
+}

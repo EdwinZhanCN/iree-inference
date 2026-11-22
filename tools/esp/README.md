@@ -54,10 +54,30 @@ esp-dl kernel imports. It runs on IREE's input-phase IR
 (`iree-compile --compile-to=input`), reads the int8 weights, bias and scales
 from the constants, and checks them against esp-dl's scheme: zero point 0,
 power-of-two scales, bias in the accumulator's scale. Ops that fail a check
-stay with IREE. Each replacement gets channels-last weights and a parameter
-array for one import, `espdl_conv2d_s8`. That import covers 1×1 and k×k
-convolutions (stride, padding, dilation, groups), depthwise, 1D convolutions,
-matrix products with constant weights, and an optional ReLU.
+stay with IREE. Three imports cover what it replaces:
+
+- `espdl_conv2d_s8`: 1×1 and k×k convolutions (stride, padding, dilation,
+  groups), depthwise, 1D convolutions, matrix products with constant
+  weights, optional ReLU. Weights are passed channels-last with a parameter
+  array.
+- `espdl_lut_s8`: any chain of elementwise ops from one int8 tensor to a
+  quantize (GELU, HardSwish, HardSigmoid, Sigmoid, requantization), as
+  esp-dl's 256-entry LUT. The script fills each table by running the chain
+  on -128..127 with IREE on the host, so the table holds what IREE computed
+  for those ops before.
+- `espdl_binary_s8`: Add and Mul of two int8 tensors (residual Add, SE
+  channel Mul, bias Add), the second one repeating along trailing dims.
+  With power-of-two scales the exact integer result rounded half to even
+  equals the float QDQ result.
+
+The kernels are channels-last (NHWC); the imported model is channels-first.
+The script does not transpose around each kernel. It carries each kernel's
+NHWC result forward: elementwise ops, reductions, quantize/dequantize,
+Resize, Concat, Pad and pooling that read it are rewritten to NHWC (the
+iteration space stays, only indexing maps, dims and pads are permuted). A
+transpose is left only where an op needs NCHW. IREE's own transpose
+propagation does not do this: it stops at `quantize_affine` and
+`dequantize_affine`.
 
 A transform spec (`--iree-preprocessing-transform-spec-filename`) was tried
 first. Its matcher compares attributes exactly, so every stride, padding and
@@ -76,13 +96,16 @@ just esp-ppocr-p4 rec      # P4 static library with esp-dl dispatches
 just esp-ppocr-p4 rec iree # P4 static library, IREE codegen only
 ```
 
-| Model | Ops to esp-dl | Host result | P4 `.text` (IREE only → esp-dl) |
-| --- | --- | --- | --- |
-| rec | 35 (21 1×1, 2 3×3/s2, 9 depthwise, 1 Conv1D, 2 MatMul) | bit-exact with ORT and ESP-PPQ | 7,763 KiB → 161 KiB |
-| det | 65 (48 conv, 17 depthwise 3×3/5×5) | bit-exact with ORT and ESP-PPQ | not measured |
+| Model | Ops to esp-dl | Transposes left | Host result | P4 `.text` |
+| --- | --- | --- | --- | --- |
+| rec | 72: 38 conv/MatMul, 22 LUT, 12 Add/Mul | 3 | bit-exact with ORT and ESP-PPQ | 18 KiB (IREE only: 7,763 KiB) |
+| det | 162: 85 conv, 42 LUT, 35 Add/Mul | 7 | bit-exact with ORT and ESP-PPQ | 58 KiB |
 
-The rest of the P4 code is elementwise ops (activations, Add, Mul, the
-NCHW↔NHWC transposes around each dispatch) and small matrix-vector products.
+What stays with IREE: the global average pools of the SE blocks and
+AveragePool (reductions), Resize, Concat, MaxPool, the two ConvTranspose of
+det (lowered `InsertZeros`), and rec's float depthwise Conv1D after the
+AveragePool (its input is not quantized in the export). The transposes left
+are the model input and output, and around those last two.
 
 Known workarounds:
 
