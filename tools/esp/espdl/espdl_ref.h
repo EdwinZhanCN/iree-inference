@@ -22,6 +22,7 @@ extern "C" {
 enum {
   ESPDL_OK = 0,
   ESPDL_ERR_SHAPE = 1,
+  ESPDL_ERR_UNSUPPORTED = 2,  // valid arguments the backend has no kernel for
 };
 
 // Parameters of espdl_ref_conv2d_s8, an int32 array in this order. Written by
@@ -54,7 +55,10 @@ enum {
 // depthwise (G = C = O), 1D (H = 1) and matrix products (1x1, H = 1).
 //
 //   x:     int8  [H][W][C]             scale 2^x_exp
-//   w:     int8  [O][KH][KW][C/G]      scale 2^w_exp[o]
+//   w:     int8  esp-dl's ESP32-P4 filter layout, scale 2^w_exp[o]: output
+//          channels in blocks of 16, each [KH][KW][C/G][16]; the last O % 16
+//          channels after them as [O % 16][KH][KW][C/G], for depthwise
+//          (G = C = O) as [KH][KW][O % 16]
 //   bias:  int32 [O]                   scale 2^(x_exp + w_exp[o])
 //   y:     int8  [OH][OW][O]           scale 2^y_exp
 int espdl_ref_conv2d_s8(const int8_t* x, const int8_t* w, const int32_t* bias,

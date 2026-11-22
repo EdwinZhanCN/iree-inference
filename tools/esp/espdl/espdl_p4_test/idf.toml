@@ -1,0 +1,14 @@
+[project]
+name = "espdl_p4_test"
+target = "esp32p4"
+idf = "6.0"
+
+[dependencies]
+espdl_p4 = { path = "../espdl_p4" }
+
+[config]
+ESP32P4_SELECTS_REV_LESS_V3 = true
+ESP_MAIN_TASK_STACK_SIZE = 16384
+ESPTOOLPY_FLASHSIZE_16MB = true
+PARTITION_TABLE_CUSTOM = true
+PARTITION_TABLE_CUSTOM_FILENAME = "../../../../partitions.csv"

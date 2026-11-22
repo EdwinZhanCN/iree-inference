@@ -463,6 +463,20 @@ def evaluate_luts(luts):
 
 # ---- Emission -------------------------------------------------------------------
 
+def pack_filter(w, depthwise):
+    """OHWI int8 weights in esp-dl's ESP32-P4 layout (ESP-PPQ's
+    ResetParamLayoutPattern): output channels in blocks of 16, each block
+    (H, W, I, 16); the remaining channels after them as OHWI, or for depthwise
+    (H, W, O)."""
+    o, kh, kw, c = w.shape
+    al = o // 16 * 16
+    head = w[:al].reshape(o // 16, 16, kh, kw, c).transpose(0, 2, 3, 4, 1)
+    tail = w[al:]
+    if depthwise:
+        tail = tail.transpose(3, 1, 2, 0)  # (1, H, W, O_rem)
+    return np.concatenate([head.reshape(-1), tail.reshape(-1)])
+
+
 # Imports: bindings in order, the last one the output. Each is passed to the
 # import as a base pointer and an element offset (espdl_ref.h, host_plugin.c).
 IMPORTS = {
@@ -543,7 +557,8 @@ def emit_func(name, m):
     if m["kind"] == "conv":
         params = np.array([m[k] for k in PARAMS], dtype=np.int32)
         return emit_dispatch(name, "conv2d_s8", [m["k_in_shape"]],
-                             [(m["w"], "i8"), (m["bias_acc"], "i32"), (m["w_exp"], "i8"),
+                             [(pack_filter(m["w"], m["G"] > 1), "i8"), (m["bias_acc"], "i32"),
+                              (m["w_exp"], "i8"),
                               (params, "i32")], m["k_shape"])
     if m["kind"] == "lut":
         n = int(np.prod(m["k_shape"]))

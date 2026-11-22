@@ -88,7 +88,12 @@ The import is resolved at run time:
 - On the host, `espdl/host_plugin.c` is an IREE executable plugin over C
   reference implementations (`espdl/espdl_ref.c`). `espdl/espdl_ref.h` is the
   contract: layouts, parameters, round half to even.
-- On ESP32-P4, the same import name will resolve to an adapter over esp-dl.
+- On ESP32-P4, `espdl/espdl_p4` (an ESP-IDF component) implements the same
+  imports over esp-dl's `dl::base` kernels, single core. It wraps IREE's
+  buffers in `TensorBase` views without copying: the rewriter already packs
+  weights in esp-dl's ESP32-P4 filter layout (blocks of 16 output channels,
+  as ESP-PPQ exports them), and `espdl/espdl_imports.h` holds the argument
+  structs both backends unpack.
 
 ```sh
 just esp-ppocr-espdl rec   # host: IREE + reference kernels vs ORT
@@ -106,6 +111,15 @@ AveragePool (reductions), Resize, Concat, MaxPool, the two ConvTranspose of
 det (lowered `InsertZeros`), and rec's float depthwise Conv1D after the
 AveragePool (its input is not quantized in the export). The transposes left
 are the model input and output, and around those last two.
+
+`just esp-p4-kernel-test` checks the ESP32-P4 backend on a board. It takes
+every kernel configuration of both models (spatial sizes cropped), fills it
+with random data, computes the expected bytes with the reference kernels and
+builds `espdl/espdl_p4_test`, which runs the esp-dl backend and compares. On
+an ESP32-P4 rev 1.3 all 76 cases (55 convolutions, 17 Add/Mul, 4 LUT) are
+bit-exact. The firmware is an idf-next project: `idf.toml` sets the chip
+revision below 3.0 and a custom partition table, whose path is given
+relative to the project idf-next generates under `build/`.
 
 Known workarounds:
 

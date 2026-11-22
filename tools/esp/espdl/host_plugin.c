@@ -7,25 +7,9 @@
 
 #include <stddef.h>
 
+#include "espdl_imports.h"
 #include "espdl_ref.h"
 #include "iree/hal/local/executable_plugin.h"
-
-// Argument struct of an import, as declared in espdl_rewrite.py: each
-// memref<T> becomes a base pointer followed by an index offset (in elements).
-typedef struct {
-  const int8_t* x;
-  size_t x_offset;
-  const int8_t* w;
-  size_t w_offset;
-  const int32_t* bias;
-  size_t bias_offset;
-  const int8_t* w_exp;
-  size_t w_exp_offset;
-  const int32_t* params;
-  size_t params_offset;
-  int8_t* y;
-  size_t y_offset;
-} espdl_conv2d_s8_args_t;
 
 static int espdl_conv2d_s8(void* args_ptr, void* context, void* reserved) {
   (void)context;
@@ -36,18 +20,6 @@ static int espdl_conv2d_s8(void* args_ptr, void* context, void* reserved) {
                              a->params + a->params_offset, a->y + a->y_offset);
 }
 
-// x, table, params, y.
-typedef struct {
-  const int8_t* x;
-  size_t x_offset;
-  const int8_t* table;
-  size_t table_offset;
-  const int32_t* params;
-  size_t params_offset;
-  int8_t* y;
-  size_t y_offset;
-} espdl_lut_s8_args_t;
-
 static int espdl_lut_s8(void* args_ptr, void* context, void* reserved) {
   (void)context;
   (void)reserved;
@@ -56,18 +28,6 @@ static int espdl_lut_s8(void* args_ptr, void* context, void* reserved) {
                           a->params + a->params_offset, a->y + a->y_offset);
 }
 
-// a, b, params, y.
-typedef struct {
-  const int8_t* a;
-  size_t a_offset;
-  const int8_t* b;
-  size_t b_offset;
-  const int32_t* params;
-  size_t params_offset;
-  int8_t* y;
-  size_t y_offset;
-} espdl_binary_s8_args_t;
-
 static int espdl_binary_s8(void* args_ptr, void* context, void* reserved) {
   (void)context;
   (void)reserved;
@@ -75,10 +35,6 @@ static int espdl_binary_s8(void* args_ptr, void* context, void* reserved) {
   return espdl_ref_binary_s8(a->a + a->a_offset, a->b + a->b_offset,
                              a->params + a->params_offset, a->y + a->y_offset);
 }
-
-// Signature of an import as IREE calls it (executable_library.h,
-// iree_hal_executable_import_v0_t).
-typedef int (*espdl_import_fn_t)(void* params, void* context, void* reserved);
 
 typedef struct {
   const char* name;

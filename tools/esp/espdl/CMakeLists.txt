@@ -15,3 +15,10 @@ if(NOT MSVC)
   target_compile_options(espdl_host_plugin PRIVATE -Wall -Wextra)
   target_link_libraries(espdl_host_plugin PRIVATE m)
 endif()
+
+# The reference kernels with visible symbols, for gen_vectors.py (ctypes).
+add_library(espdl_ref SHARED espdl_ref.c)
+set_target_properties(espdl_ref PROPERTIES C_STANDARD 11)
+if(NOT MSVC)
+  target_compile_options(espdl_ref PRIVATE -Wall -Wextra)
+endif()

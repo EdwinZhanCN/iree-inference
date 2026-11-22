@@ -14,6 +14,16 @@ static int8_t saturate_s8(int64_t v) {
   return (int8_t)(v < -128 ? -128 : v > 127 ? 127 : v);
 }
 
+// Index of weight (o, kh, kw, c) in esp-dl's packed filter layout.
+static int64_t filter_index(int32_t o, int32_t kh, int32_t kw, int32_t c, int32_t O,
+                            int32_t KH, int32_t KW, int32_t cpg, int depthwise) {
+  const int32_t al = O / 16 * 16;
+  const int64_t taps = (int64_t)KH * KW * cpg;
+  if (o < al) return ((o / 16) * taps + ((int64_t)kh * KW + kw) * cpg + c) * 16 + o % 16;
+  if (depthwise) return al * taps + ((int64_t)kh * KW + kw) * (O - al) + (o - al);
+  return al * taps + (o - al) * taps + ((int64_t)kh * KW + kw) * cpg + c;
+}
+
 int espdl_ref_conv2d_s8(const int8_t* x, const int8_t* w, const int32_t* bias,
                         const int8_t* w_exp, const int32_t* p, int8_t* y) {
   const int32_t H = p[ESPDL_CONV_H], W = p[ESPDL_CONV_W], C = p[ESPDL_CONV_C];
@@ -48,8 +58,9 @@ int espdl_ref_conv2d_s8(const int8_t* x, const int8_t* w, const int32_t* bias,
             const int32_t iw = ow * SW - PL + kw * DW;
             if (iw < 0 || iw >= W) continue;
             const int8_t* xs = x + ((int64_t)ih * W + iw) * C + (int64_t)g * cpg;
-            const int8_t* ws = w + (((int64_t)o * KH + kh) * KW + kw) * cpg;
-            for (int32_t c = 0; c < cpg; ++c) acc += (int32_t)xs[c] * ws[c];
+            for (int32_t c = 0; c < cpg; ++c) {
+              acc += (int32_t)xs[c] * w[filter_index(o, kh, kw, c, O, KH, KW, cpg, G > 1)];
+            }
           }
         }
         if (relu && acc < 0) acc = 0;

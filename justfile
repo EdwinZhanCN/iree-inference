@@ -122,6 +122,8 @@ esp_out := root / "third_party" / "esp-out"
 esp_rewrite := esp_tools / "espdl" / "espdl_rewrite.py"
 esp_plugin_build := root / "third_party" / "espdl-plugin-build"
 esp_plugin := esp_plugin_build / if os_family() == "windows" { "espdl_host_plugin.dll" } else { "libespdl_host_plugin.so" }
+esp_ref_lib := esp_plugin_build / if os() == "macos" { "libespdl_ref.dylib" } else if os_family() == "windows" { "espdl_ref.dll" } else { "libespdl_ref.so" }
+esp_kernel_test := esp_tools / "espdl" / "espdl_p4_test"
 esp_p4_flags := "--iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-triple=riscv32-pc-linux-elf --iree-llvmcpu-target-cpu=generic-rv32 --iree-llvmcpu-target-abi=ilp32f --iree-llvmcpu-target-cpu-features=+m,+a,+f,+c"
 
 [doc("Create the ESP tooling venv in .venv-esp (esp-ppq, torch, IREE compiler + runtime)")]
@@ -172,4 +174,25 @@ esp-ppocr-p4 m kernels="espdl": (_esp-rewrite m)
     {{ quote(esp_bin / "iree-compile" + esp_exe) }} {{ quote(esp_out / m / m + (if kernels == "espdl" { ".espdl.mlir" } else if kernels == "iree" { ".input.mlir" } else { error("kernels must be espdl or iree") })) }} --compile-from=input {{ esp_p4_flags }} --iree-llvmcpu-link-embedded=false --iree-llvmcpu-link-static --iree-llvmcpu-static-library-output-path={{ quote(esp_out / m / m + "." + kernels + ".p4.o") }} -o {{ quote(esp_out / m / m + "." + kernels + ".p4.vmfb") }}
     {{ quote(esp_py) }} {{ quote(esp_tools / "p4_size.py") }} {{ quote(esp_out / m / m + "." + kernels + ".p4.o") }}
 
+# Test vectors from the kernel configurations of both models (run esp-ppocr
+# det and rec first); expected outputs from the reference kernels. The
+# firmware compares the esp-dl backend's bytes on the board.
+[doc("Check the esp-dl kernel backend on an ESP32-P4 board against the reference kernels (build, flash, monitor)")]
+esp-p4-kernel-test: esp-venv esp-plugin
+    {{ quote(esp_py) }} {{ quote(esp_tools / "espdl" / "gen_vectors.py") }} {{ quote(esp_ref_lib) }} {{ quote(esp_kernel_test / "src" / "vectors.c") }} {{ quote(esp_out / "rec" / "rec.input.mlir") }} {{ quote(esp_out / "det" / "det.input.mlir") }}
+    idf -C {{ quote(esp_kernel_test) }} run
 
+# IREE runtime for ESP32-P4 (generic platform, local-sync, static library
+# loader), built with ESP-IDF's GCC and picolibc. Uses the host build's
+# flatcc tool, so run `just iree` first.
+[doc("Cross-compile the IREE runtime for ESP32-P4 into third_party/iree-build-p4")]
+esp-iree-p4:
+    eval "$(idf env --shell)" && cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(root / "third_party" / "iree-build-p4") }} -DCMAKE_TOOLCHAIN_FILE={{ quote(esp_tools / "firmware" / "p4_toolchain.cmake") }} -DCMAKE_BUILD_TYPE=MinSizeRel -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_HOST_BIN_DIR={{ quote(iree_build / "tools") }}
+    ninja -C {{ quote(root / "third_party" / "iree-build-p4") }} iree_runtime_unified iree_hal_local_loaders_static_library_loader iree_hal_local_executable_library_util flatcc_parsing
+
+# Whole rec on the board: compares the output bytes with the host's and
+# times each run (run esp-ppocr-espdl rec and esp-ppocr-p4 rec first).
+[doc("Run PP-OCRv6 rec through IREE + esp-dl on an ESP32-P4 board (build, flash, monitor)")]
+esp-p4-rec: esp-venv esp-plugin esp-iree-p4
+    {{ quote(esp_py) }} {{ quote(esp_tools / "firmware" / "gen_model_io.py") }} {{ quote(esp_plugin) }} {{ quote(esp_out / "rec" / "rec.espdl.host.vmfb") }} rec {{ quote(esp_out / "rec" / "model_io") }}
+    idf -C {{ quote(esp_tools / "firmware" / "rec_p4") }} run

@@ -1,0 +1,17 @@
+[project]
+name = "rec_p4"
+target = "esp32p4"
+idf = "6.0"
+
+[dependencies]
+espdl_p4 = { path = "../../espdl/espdl_p4" }
+iree_runtime = { path = "../iree_runtime" }
+rec_model = { path = "../rec_model" }
+
+[config]
+ESP32P4_SELECTS_REV_LESS_V3 = true
+ESP_MAIN_TASK_STACK_SIZE = 32768
+ESPTOOLPY_FLASHSIZE_16MB = true
+SPIRAM = true
+PARTITION_TABLE_CUSTOM = true
+PARTITION_TABLE_CUSTOM_FILENAME = "../../../../partitions.csv"

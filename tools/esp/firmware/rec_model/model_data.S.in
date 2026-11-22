@@ -1,0 +1,9 @@
+/* The bytecode module, in flash, aligned for IREE's FlatBuffer verifier
+   (EMBED_FILES does not align its data). Generated from model_data.S.in. */
+    .section .rodata.rec_model_vmfb, "a"
+    .balign 64
+    .global rec_model_vmfb_start
+rec_model_vmfb_start:
+    .incbin "@VMFB@"
+    .global rec_model_vmfb_end
+rec_model_vmfb_end:
