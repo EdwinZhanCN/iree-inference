@@ -95,6 +95,10 @@ static const iree_hal_executable_library_header_t** prof_library_query(
 static uint32_t g_alloc_calls = 0;
 static uint32_t g_free_calls = 0;
 static uint64_t g_alloc_cycles = 0;
+static uint32_t g_sram_allocs = 0;
+static uint32_t g_psram_allocs = 0;
+static bool g_in_invoke = false;
+static bool g_log_slabs = false;
 
 static iree_status_t prof_alloc_ctl(void* self, iree_allocator_command_t command,
                                     const void* params, void** inout_ptr) {
@@ -120,6 +124,8 @@ static void reset_dispatch_stats(void) {
   g_alloc_calls = 0;
   g_free_calls = 0;
   g_alloc_cycles = 0;
+  g_sram_allocs = 0;
+  g_psram_allocs = 0;
 }
 
 // Import provider: esp-dl kernels by name.
@@ -149,6 +155,8 @@ static iree_status_t resolve_imports(void* self, iree_host_size_t count,
   return iree_ok_status();
 }
 
+#define SRAM_RESERVE_BYTES (64 * 1024)
+
 static iree_status_t device_slab_alloc_ctl(void* self, iree_allocator_command_t command,
                                            const void* params, void** inout_ptr) {
   (void)self;
@@ -160,12 +168,32 @@ static iree_status_t device_slab_alloc_ctl(void* self, iree_allocator_command_t 
     }
     if (n > 256) {
       // iree_hal_heap_buffer_allocate_slab allocates [aligned header | tensor payload].
-      // Zero only the metadata prefix; skip zero-filling large PSRAM tensor payloads.
+      // Route transient activations into internal SRAM when headroom permits, otherwise PSRAM.
+      // Zero only the metadata prefix; skip zero-filling large tensor payloads.
       const uint32_t c0 = esp_cpu_get_cycle_count();
-      void* p = malloc(n);
+      void* p = NULL;
+      bool in_sram = false;
+      if (g_in_invoke &&
+          heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= n + SRAM_RESERVE_BYTES) {
+        p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        in_sram = (p != NULL);
+      }
+      if (!p) {
+        p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      }
+      if (!p) {
+        p = malloc(n);
+      }
       if (p) memset(p, 0, 256);
       g_alloc_cycles += esp_cpu_get_cycle_count() - c0;
       ++g_alloc_calls;
+      if (in_sram) ++g_sram_allocs;
+      else ++g_psram_allocs;
+      if (g_log_slabs) {
+        printf("  slab alloc %7u B -> %s (invoke=%d, sram_free=%u)\n",
+               (unsigned)n, in_sram ? "SRAM" : "PSRAM", (int)g_in_invoke,
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      }
       if (!p) {
         return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "slab malloc failed");
       }
@@ -298,9 +326,13 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
 
     espdl_p4_reset_stats();
     reset_dispatch_stats();
+    g_log_slabs = (r == 0);
+    g_in_invoke = true;
     const int64_t t0 = esp_timer_get_time();
     if (iree_status_is_ok(status)) status = iree_runtime_call_invoke(&call, 0);
     const int64_t t1 = esp_timer_get_time();
+    g_in_invoke = false;
+    g_log_slabs = false;
     espdl_p4_stats_t st;
     espdl_p4_get_stats(&st);
 
@@ -338,7 +370,9 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
           const double ms = g_disp_cycles[i] / 360000.0;
           const bool is_espdl = (strcmp(name, "conv2d_s8") == 0 ||
                                  strcmp(name, "lut_s8") == 0 ||
+                                 strcmp(name, "lut_s8_ip") == 0 ||
                                  strcmp(name, "binary_s8") == 0 ||
+                                 strcmp(name, "binary_s8_ip") == 0 ||
                                  strcmp(name, "quant_s8") == 0 ||
                                  strcmp(name, "dequant_s8_f32") == 0);
           if (is_espdl) sum_espdl_disp_ms += ms;
@@ -349,10 +383,11 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
         }
         const double vm_hal_ms = (total_us / 1000.0) - sum_iree_disp_ms - sum_espdl_disp_ms;
         const double alloc_ms = g_alloc_cycles / 360000.0;
-        printf("  summary: espdl_disp %.2f ms (inner %.2f + teardown/glue %.2f) | iree_disp %.2f ms | vm/hal %.2f ms (alloc %.2f ms: %lu alloc, %lu free)\n",
+        printf("  summary: espdl_disp %.2f ms (inner %.2f + teardown/glue %.2f) | iree_disp %.2f ms | vm/hal %.2f ms (alloc %.2f ms: %lu alloc [%lu sram, %lu psram], %lu free)\n",
                sum_espdl_disp_ms, espdl_us / 1000.0, sum_espdl_disp_ms - espdl_us / 1000.0,
                sum_iree_disp_ms, vm_hal_ms, alloc_ms,
-               (unsigned long)g_alloc_calls, (unsigned long)g_free_calls);
+               (unsigned long)g_alloc_calls, (unsigned long)g_sram_allocs,
+               (unsigned long)g_psram_allocs, (unsigned long)g_free_calls);
       }
       ok_runs += compare(y, (const float*)expected_start, steps, classes);
     }

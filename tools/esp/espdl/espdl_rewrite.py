@@ -490,16 +490,20 @@ IMPORTS = {
 
 
 def executable_text(used):
-    exports, funcs = [], []
-    for name in used:
-        binds = IMPORTS[name]
+    exports, funcs, priv_decls = [], [], {}
+    for export_name in used:
+        inplace = export_name.endswith("_ip")
+        imp = export_name[:-3] if inplace else export_name
+        all_binds = IMPORTS[imp]
+        binds = all_binds[:-1] if inplace else all_binds
         exports.append(
-            f"  stream.executable.export public @{name} workgroups() -> (index, index, index) {{\n"
+            f"  stream.executable.export public @{export_name} workgroups() -> (index, index, index) {{\n"
             f"    %c1 = arith.constant 1 : index\n"
             f"    hal.return %c1, %c1, %c1 : index, index, index\n  }}")
-        decl = ", ".join(f"memref<{t}>, index" for _, t in binds)
-        lines = [f"    func.func private @espdl_{name}({decl}) attributes {{llvm.bareptr}}",
-                 f"    func.func @{name}(" +
+        if imp not in priv_decls:
+            decl = ", ".join(f"memref<{t}>, index" for _, t in all_binds)
+            priv_decls[imp] = f"    func.func private @espdl_{imp}({decl}) attributes {{llvm.bareptr}}"
+        lines = [f"    func.func @{export_name}(" +
                  ", ".join(f"%{n}_b: !stream.binding" for n, _ in binds) + ", " +
                  ", ".join(f"%{n}_n: i32" for n, _ in binds) + ") {",
                  "      %c0 = arith.constant 0 : index"]
@@ -512,11 +516,15 @@ def executable_text(used):
                 f" : memref<?x{t}> -> memref<{t}>, index, index, index"]
             args += [f"%{n}_p", f"%{n}_o"]
             types += [f"memref<{t}>", "index"]
-        lines += [f"      func.call @espdl_{name}({', '.join(args)}) : ({', '.join(types)}) -> ()",
+        if inplace:
+            args += [args[0], args[1]]
+            types += [types[0], types[1]]
+        lines += [f"      func.call @espdl_{imp}({', '.join(args)}) : ({', '.join(types)}) -> ()",
                   "      return", "    }"]
         funcs.append("\n".join(lines))
     return ("stream.executable private @espdl_executable {\n" + "\n".join(exports) +
-            "\n  builtin.module {\n" + "\n".join(funcs) + "\n  }\n}\n")
+            "\n  builtin.module {\n" + "\n".join(priv_decls.values()) + "\n" +
+            "\n".join(funcs) + "\n  }\n}\n")
 
 
 def tensor_t(dims, elem="i8"):
@@ -528,10 +536,11 @@ def dense(arr, elem):
     return f'dense<"0x{data.hex().upper()}"> : tensor<{arr.size}x{elem}>'
 
 
-def emit_dispatch(fname, imp, args, consts, out_shape, arg_elems=None, out_elem="i8"):
+def emit_dispatch(fname, imp, args, consts, out_shape, arg_elems=None, out_elem="i8", inplace=False):
     """util.func @fname(args...) dispatching import imp. args: shapes of the
     function's arguments; consts: (array, elem) bound after them."""
-    binds = IMPORTS[imp]
+    export_name = f"{imp}_ip" if inplace else imp
+    binds = IMPORTS[imp][:-1] if inplace else IMPORTS[imp]
     if arg_elems is None:
         arg_elems = ["i8"] * len(args)
     arg_ts = [tensor_t(a, e) for a, e in zip(args, arg_elems)]
@@ -545,14 +554,16 @@ def emit_dispatch(fname, imp, args, consts, out_shape, arg_elems=None, out_elem=
         vals.append(f"%k{k}")
         types.append(f"tensor<{arr.size}x{elem}>")
         sizes.append(int(arr.size))
-    sizes.append(int(np.prod(out_shape)))
+    if not inplace:
+        sizes.append(int(np.prod(out_shape)))
     assert len(sizes) == len(binds)
     for k, n in enumerate(sizes):
         lines.append(f"  %n{k} = arith.constant {n} : i32")
-    lines += [f"  %y = flow.dispatch @espdl_executable::@{imp}({', '.join(vals)}, " +
+    ret_sig = f"%a0 as {out_t}" if inplace else out_t
+    lines += [f"  %y = flow.dispatch @espdl_executable::@{export_name}({', '.join(vals)}, " +
               ", ".join(f"%n{k}" for k in range(len(sizes))) + ") : (" +
               ", ".join(types) + ", " + ", ".join("i32" for _ in sizes) +
-              f") -> {out_t}",
+              f") -> {ret_sig}",
               f"  util.return %y : {out_t}", "}"]
     return "\n".join(lines)
 
@@ -568,7 +579,8 @@ def emit_func(name, m):
     if m["kind"] == "lut":
         n = int(np.prod(m["k_shape"]))
         return emit_dispatch(name, "lut_s8", [m["k_shape"]],
-                             [(m["table"], "i8"), (np.array([n], np.int32), "i32")], m["k_shape"])
+                             [(m["table"], "i8"), (np.array([n], np.int32), "i32")],
+                             m["k_shape"], inplace=m.get("inplace", False))
     if m["kind"] == "quant":
         params = np.array(m["params"], dtype=np.int32)
         return emit_dispatch(name, "quant_s8", [m["in_shape"]], [(params, "i32")],
@@ -579,7 +591,7 @@ def emit_func(name, m):
                              m["out_shape"], arg_elems=["i8"], out_elem="f32")
     params = np.array(m["params"], dtype=np.int32)
     return emit_dispatch(name, "binary_s8", [m["k_a_shape"], m["k_b_shape"]],
-                         [(params, "i32")], m["k_shape"])
+                         [(params, "i32")], m["k_shape"], inplace=m.get("inplace", False))
 
 
 # ---- Layout ---------------------------------------------------------------------
@@ -987,15 +999,24 @@ def main():
 
         io_live = rewrite_io_qdq(module, layout)
         calls = {}
+        single_use_arg0 = set()
         for op in walk(module.operation):
             if op.name == "util.call":
                 callee = str(op.attributes["callee"])[1:]
                 calls[callee] = calls.get(callee, 0) + 1
+                if len(op.operands) >= 1 and len(list(op.operands[0].uses)) == 1:
+                    single_use_arg0.add(callee)
         live = [(name, m) for i, (name, (_, m)) in enumerate(zip(names, matches)) if i not in declined]
         live.extend(io_live)
-        used = sorted({ {"conv": "conv2d_s8", "lut": "lut_s8", "binary": "binary_s8",
-                         "quant": "quant_s8", "dequant": "dequant_s8_f32"}[m["kind"]]
-                        for _, m in live})
+        for name, m in live:
+            if m["kind"] in ("lut", "binary") and name in single_use_arg0:
+                m["inplace"] = True
+        kind_to_imp = {"conv": "conv2d_s8", "lut": "lut_s8", "binary": "binary_s8",
+                       "quant": "quant_s8", "dequant": "dequant_s8_f32"}
+        used = sorted({
+            kind_to_imp[m["kind"]] + ("_ip" if m.get("inplace") else "")
+            for _, m in live
+        })
         funcs = [emit_func(name, m) for name, m in live]
         funcs += [text for name, text in layout.helpers.items() if name in calls]
         if funcs:

@@ -146,11 +146,12 @@ Measured on ESP32-P4 rev 1.3 @ 360 MHz (`firmware/rec_p4`), warm runs (run 1–2
 | Baseline (`-Og`) | ~456 ms | 267.8 ms | Initial `esp-dl` integration |
 | Compiler `-O2` | ~456 ms | 265.9 ms | `COMPILER_OPTIMIZATION_PERF = true` in `rec_p4/idf.toml` |
 | Slab `calloc` bypass + setup elimination | 390.2 ms | 199.95 ms | `alloc` `19.64 -> 0.16 ms`; `conv/bin` setup `27.77 -> 1.56 ms` |
-| Boundary `quant_s8` + `dequant_s8_f32` | **376.3 ms** | **185.4 ms** | `quant` `10.84 -> 4.26 ms`; `dequant` `23.54 -> 15.49 ms` |
+| Boundary `quant_s8` + `dequant_s8_f32` | 376.3 ms | 185.4 ms | `quant` `10.84 -> 4.26 ms`; `dequant` `23.54 -> 15.49 ms` |
+| In-place LUT/binary + SRAM transient slab | **312.5 ms** | **132.5 ms** | Tied `lut_s8_ip`/`binary_s8_ip`; transient slab `596.9 -> 314.2 KB` in internal SRAM |
 
-Total PSRAM-copy speedup: **-82.4 ms (-30.8%)**.
+Total PSRAM-copy speedup: **-135.3 ms (-50.5%)**.
 
-Details of the three optimizations:
+Details of the four optimizations:
 
 1. **Skip PSRAM payload zero-fill in HAL heap slab allocator (`firmware/rec_p4/src/main.c`)**:
    `iree_hal_allocator_create_heap` zeroes ~1.88 MiB of temporary and output PSRAM buffers per run
@@ -173,10 +174,27 @@ Details of the three optimizations:
    - `espdl_dequant_s8_f32`: precomputes a 256-entry `float` LUT (`1 KiB`, L1-resident) on the stack
      and writes the `1x40x6906` (`1.05 MiB`) output via 4x unrolled table lookups (`23.54 -> 15.49 ms`,
      bound by PSRAM write-allocate + writeback bandwidth).
+4. **In-place `lut_s8`/`binary_s8` and internal-SRAM transient slab (`espdl/espdl_rewrite.py`, `firmware/rec_p4/src/main.c`)**:
+   - Previously, IREE packed all intermediate activations into a `596,916 B` `transient` slab
+     (too large for ESP32-P4's 384 KiB contiguous internal SRAM block `0x4FF40000..0x4FFA0000`)
+     because `MatMul.1` (`276,240 B`) and its untied bias `Add.106` (`276,240 B`) could not alias.
+   - `espdl_rewrite.py` now emits tied `flow.dispatch ... -> %a0` variants (`lut_s8_ip` for 15/22 LUT
+     calls, `binary_s8_ip` for 9/12 Add/Mul calls) whenever operand 0 has a single use, shrinking
+     `stream.resource<transient>` from `596,736 B` to `314,048 B` (`314,228 B` allocated) with
+     zero `stream.cmd.clone` copies.
+   - `device_slab_alloc_ctl` routes invoke-time slabs into internal SRAM while preserving at least
+     `64 KiB` (`SRAM_RESERVE_BYTES`) of internal heap headroom, placing the entire `314,228 B`
+     transient slab in internal SRAM (`178 KiB` free after alloc, `144 KiB` min free) while
+     keeping the `1,105,140 B` external output buffer in PSRAM.
 
-Warm PSRAM-copy breakdown (`186.19 ms`, run 2):
-- `espdl` dispatches (74 calls): `156.84 ms` (`conv2d_s8` 100.76 + 0.51 setup, `lut_s8` 19.74,
-  `dequant_s8_f32` 15.48, `binary_s8` 12.64 + 0.61 setup, `quant_s8` 4.29, glue 2.82)
-- Remaining IREE dispatches (6 calls): `10.04 ms` (3 SE reductions 2.56, `pooling_nhwc_sum` 4.28,
-  float `depthwise_conv1d` 3.11, `transpose` 0.09)
-- IREE VM + HAL scheduling: `19.31 ms` (`alloc` `0.17 ms`)
+Warm PSRAM-copy breakdown (`132.5 ms`, run 2):
+- `espdl` dispatches (74 calls): `112.51 ms` (`conv2d_s8` 81.97 incl. 0.19 setup, `dequant_s8_f32`
+  13.37, `lut_s8_ip` 7.51 + `lut_s8` 2.89, `quant_s8` 3.96, `binary_s8_ip` 2.21 + `binary_s8` 0.61)
+- Remaining IREE dispatches (6 calls): `9.93 ms` (3 SE reductions 2.52, `pooling_nhwc_sum` 4.24,
+  float `depthwise_conv1d` 3.09, `transpose` 0.08)
+- IREE VM + HAL scheduling: `10.08 ms` (`alloc` `0.20 ms`, `12 alloc [1 sram, 1 psram]`)
+
+For reference on the same ESP32-P4 rev 1.3 @ 360 MHz, Espressif's standalone `esp-dl 3.3.15`
+`dl::Model` running `rec.espdl` (`param_copy=true`, `1-core`) measures `131.4 ms` with `sram=0`
+and `102.3 ms` with `sram=200K` for pure `int8` inference (excluding `f32` boundary quant/dequant,
+which takes `~17.3 ms` here).
