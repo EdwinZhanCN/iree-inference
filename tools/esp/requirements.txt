@@ -1,0 +1,13 @@
+# ESP32-P4 model tooling (`just esp-venv`). The IREE packages must match the
+# runtime pinned in the justfile / Cargo.toml (vmfb is not ABI-stable).
+esp-ppq==1.3.14
+torch==2.15.0
+onnx==1.19.1
+onnxruntime==1.32.0
+onnxsim==0.8.1
+numpy==2.5.4
+pillow==13.0.0
+pyelftools==0.33
+iree-base-compiler==3.13.0
+iree-base-runtime==3.13.0
+pyyaml==6.0.3

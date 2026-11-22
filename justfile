@@ -103,3 +103,73 @@ _module-metal name:
 [windows]
 _module-metal name:
 
+# ---- ESP32-P4: PP-OCRv6 through ESP-PPQ and QDQ ONNX -----------------------
+# ESP-PPQ quantizes with esp-dl's rules (esp32p4, w8a8, power-of-two scales),
+# exports QDQ ONNX, and IREE compiles it. Tooling lives in tools/esp/ and its
+# own venv; models and outputs go under the ignored third_party/.
+
+esp_venv := root / ".venv-esp"
+esp_bin := esp_venv / if os_family() == "windows" { "Scripts" } else { "bin" }
+esp_exe := if os_family() == "windows" { ".exe" } else { "" }
+esp_py := esp_bin / "python" + esp_exe
+esp_tools := root / "tools" / "esp"
+ppocr_models := root / "third_party" / "ppocr-v6-tiny"
+esp_out := root / "third_party" / "esp-out"
+# rv32imafc with the single-precision ABI. P4's SIMD (PIE) is not known to
+# LLVM, so IREE's own codegen here is scalar.
+# esp-dl kernels: the transform spec routes quantized ops to imports; on the
+# host, a plugin with the C reference implementations resolves them.
+esp_rewrite := esp_tools / "espdl" / "espdl_rewrite.py"
+esp_plugin_build := root / "third_party" / "espdl-plugin-build"
+esp_plugin := esp_plugin_build / if os_family() == "windows" { "espdl_host_plugin.dll" } else { "libespdl_host_plugin.so" }
+esp_p4_flags := "--iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-triple=riscv32-pc-linux-elf --iree-llvmcpu-target-cpu=generic-rv32 --iree-llvmcpu-target-abi=ilp32f --iree-llvmcpu-target-cpu-features=+m,+a,+f,+c"
+
+[doc("Create the ESP tooling venv in .venv-esp (esp-ppq, torch, IREE compiler + runtime)")]
+esp-venv:
+    @{{ if path_exists(esp_py) == "true" { "" } else { "uv venv --python 3.12 " + quote(esp_venv) } }}
+    uv pip install --quiet --python {{ quote(esp_venv) }} -r {{ quote(esp_tools / "requirements.txt") }}
+
+# inference.yml holds the preprocessing and, for rec, the CTC dictionary.
+[doc("Download PP-OCRv6 tiny det/rec ONNX (PaddlePaddle on Hugging Face, Apache-2.0)")]
+ppocr-fetch: (_ppocr-fetch "det" "inference.onnx") (_ppocr-fetch "det" "inference.yml") (_ppocr-fetch "rec" "inference.onnx") (_ppocr-fetch "rec" "inference.yml")
+
+_ppocr-fetch m file:
+    cmake -E make_directory {{ quote(ppocr_models / m) }}
+    @{{ if path_exists(ppocr_models / m / file) == "true" { "" } else { "curl -sSfL -o " + quote(ppocr_models / m / file) + " https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_" + m + "_onnx/resolve/main/" + file } }}
+
+# Host CPU is `generic`: IREE 3.13 crashes lowering i8mm contractions for
+# Apple Silicon on the rec model.
+[doc("Quantize a PP-OCRv6 model (det|rec) for esp32p4, compile it for the host, compare ESP-PPQ / ORT / IREE")]
+esp-ppocr m: esp-venv ppocr-fetch
+    {{ quote(esp_py) }} {{ quote(esp_tools / "quant_export.py") }} {{ quote(ppocr_models / m / "inference.onnx") }} {{ quote(esp_out / m) }} {{ m }} {{ if m == "det" { "1 3 736 736" } else if m == "rec" { "1 3 48 320" } else { error("model must be det or rec") } }}
+    {{ quote(esp_py) }} {{ quote(esp_tools / "fix_qdq.py") }} {{ quote(esp_out / m / m + ".qdq.onnx") }} {{ quote(esp_out / m / m + ".qdq.std.onnx") }}
+    {{ quote(esp_bin / "iree-import-onnx" + esp_exe) }} {{ quote(esp_out / m / m + ".qdq.std.onnx") }} --opset-version 17 -o {{ quote(esp_out / m / m + ".qdq.mlir") }}
+    {{ quote(esp_bin / "iree-compile" + esp_exe) }} {{ quote(esp_out / m / m + ".qdq.mlir") }} --iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-cpu=generic -o {{ quote(esp_out / m / m + ".host.vmfb") }}
+    {{ quote(esp_py) }} {{ quote(esp_tools / "compare_iree_ort.py") }} {{ quote(esp_out / m / m + ".host.vmfb") }} {{ quote(esp_out / m / m + ".qdq.std.onnx") }} {{ quote(esp_out / m / m + ".fp32.onnx") }} {{ quote(esp_out / m / m + ".ppq_sim.npy") }} {{ m }} {{ quote(ppocr_models / m / "inference.yml") }}
+
+[doc("Build the host plugin with the esp-dl kernel reference implementations (needs cmake and ninja)")]
+esp-plugin: _iree-clone
+    cmake -G Ninja -S {{ quote(esp_tools / "espdl") }} -B {{ quote(esp_plugin_build) }} -DCMAKE_BUILD_TYPE=Release -DIREE_SOURCE_DIR={{ quote(iree_src) }}
+    ninja -C {{ quote(esp_plugin_build) }}
+
+[doc("Compile a quantized PP-OCRv6 model (after esp-ppocr) with esp-dl kernel dispatches for the host; compare against ORT with the reference plugin")]
+esp-ppocr-espdl m: esp-venv esp-plugin (_esp-rewrite m)
+    {{ quote(esp_bin / "iree-compile" + esp_exe) }} {{ quote(esp_out / m / m + ".espdl.mlir") }} --compile-from=input --iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-cpu=generic -o {{ quote(esp_out / m / m + ".espdl.host.vmfb") }}
+    {{ quote(esp_py) }} {{ quote(esp_tools / "compare_iree_ort.py") }} --plugin {{ quote(esp_plugin) }} {{ quote(esp_out / m / m + ".espdl.host.vmfb") }} {{ quote(esp_out / m / m + ".qdq.std.onnx") }} {{ quote(esp_out / m / m + ".fp32.onnx") }} {{ quote(esp_out / m / m + ".ppq_sim.npy") }} {{ m }} {{ quote(ppocr_models / m / "inference.yml") }}
+
+# Input-phase IR with esp-dl kernel dispatches in place of quantized
+# convolutions and matrix products (target independent).
+_esp-rewrite m: esp-venv
+    {{ quote(esp_bin / "iree-compile" + esp_exe) }} {{ quote(esp_out / m / m + ".qdq.mlir") }} --compile-to=input -o {{ quote(esp_out / m / m + ".input.mlir") }}
+    {{ quote(esp_py) }} {{ quote(esp_rewrite) }} {{ quote(esp_out / m / m + ".input.mlir") }} {{ quote(esp_out / m / m + ".espdl.mlir") }}
+
+# Static library: one LLVM module, compiled serially (det takes ~10 minutes
+# without esp-dl kernels). Unresolved libgcc helpers (e.g. __fixsfdi) come
+# from the firmware link; esp-dl kernel imports from the firmware's import
+# provider. `kernels="iree"` compiles everything with IREE's own codegen.
+[doc("Compile a quantized PP-OCRv6 model (after esp-ppocr) for ESP32-P4 as a static library; report code size")]
+esp-ppocr-p4 m kernels="espdl": (_esp-rewrite m)
+    {{ quote(esp_bin / "iree-compile" + esp_exe) }} {{ quote(esp_out / m / m + (if kernels == "espdl" { ".espdl.mlir" } else if kernels == "iree" { ".input.mlir" } else { error("kernels must be espdl or iree") })) }} --compile-from=input {{ esp_p4_flags }} --iree-llvmcpu-link-embedded=false --iree-llvmcpu-link-static --iree-llvmcpu-static-library-output-path={{ quote(esp_out / m / m + "." + kernels + ".p4.o") }} -o {{ quote(esp_out / m / m + "." + kernels + ".p4.vmfb") }}
+    {{ quote(esp_py) }} {{ quote(esp_tools / "p4_size.py") }} {{ quote(esp_out / m / m + "." + kernels + ".p4.o") }}
+
+

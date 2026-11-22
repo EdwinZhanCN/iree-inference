@@ -1,5 +1,7 @@
 /target
 /.venv
+/.venv-esp
 /third_party
 /testdata/build
 .DS_Store
+__pycache__/
