@@ -185,9 +185,9 @@ sha256 = "da97440e74a9ff36370bdb598cf421a8183c11ae6fb44431be594ad16dbe77ef"
 size = 46924973
 
 [[component]]
-name = "espdl_p4"
+name = "espdl_adapter"
 version = "*"
-source = "path+/Volumes/CodeBase/iree-inference/tools/esp/espdl/espdl_p4"
+source = "path+/Volumes/CodeBase/iree-inference/backends/esp32p4/components/espdl_adapter"
 
 [[component]]
 name = "espressif/dl_fft"
@@ -208,11 +208,11 @@ source = "registry+https://components.espressif.com"
 hash = "sha256:e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c"
 
 [[component]]
-name = "iree_runtime"
+name = "iree_hal_p4"
 version = "*"
-source = "path+/Volumes/CodeBase/iree-inference/tools/esp/firmware/iree_runtime"
+source = "path+/Volumes/CodeBase/iree-inference/backends/esp32p4/components/iree_hal_p4"
 
 [[component]]
 name = "rec_model"
 version = "*"
-source = "path+/Volumes/CodeBase/iree-inference/tools/esp/firmware/rec_model"
+source = "path+rec_model"

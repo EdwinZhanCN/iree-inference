@@ -2,7 +2,7 @@
 # p4_toolchain.cmake (generic platform, local-sync, static library loader).
 set(repo "${CMAKE_CURRENT_LIST_DIR}/../../../..")
 set(src "${repo}/third_party/iree/runtime/src")
-set(build "${repo}/third_party/iree-build-p4")
+set(build "${repo}/third_party/iree-build-esp32p4")
 
 # The proactor replaces the runtime's iree_async_proactor_create_platform
 # (see the file); WHOLE_ARCHIVE keeps it ahead of the runtime archive.

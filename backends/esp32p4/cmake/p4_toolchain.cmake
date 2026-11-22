@@ -5,8 +5,8 @@
 # local-sync driver and the static library loader only. Time comes from
 # esp_timer.
 #
-#   cmake -G Ninja -S third_party/iree -B third_party/iree-build-p4 \
-#     -DCMAKE_TOOLCHAIN_FILE=tools/esp/firmware/p4_toolchain.cmake \
+#   cmake -G Ninja -S third_party/iree -B third_party/iree-build-esp32p4 \
+#     -DCMAKE_TOOLCHAIN_FILE=backends/esp32p4/cmake/p4_toolchain.cmake \
 #     -DESP_GCC_ROOT=<dir containing bin/riscv32-esp-elf-gcc>
 
 cmake_minimum_required(VERSION 3.21)

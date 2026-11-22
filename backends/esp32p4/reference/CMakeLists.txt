@@ -9,7 +9,9 @@ if(NOT EXISTS "${IREE_SOURCE_DIR}/runtime/src/iree/hal/local/executable_plugin.h
 endif()
 
 add_library(espdl_host_plugin MODULE host_plugin.c espdl_ref.c)
-target_include_directories(espdl_host_plugin PRIVATE "${IREE_SOURCE_DIR}/runtime/src")
+target_include_directories(espdl_host_plugin PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/../abi"
+  "${IREE_SOURCE_DIR}/runtime/src")
 set_target_properties(espdl_host_plugin PROPERTIES C_STANDARD 11 C_VISIBILITY_PRESET hidden)
 if(NOT MSVC)
   target_compile_options(espdl_host_plugin PRIVATE -Wall -Wextra)
@@ -18,6 +20,7 @@ endif()
 
 # The reference kernels with visible symbols, for gen_vectors.py (ctypes).
 add_library(espdl_ref SHARED espdl_ref.c)
+target_include_directories(espdl_ref PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../abi")
 set_target_properties(espdl_ref PROPERTIES C_STANDARD 11)
 if(NOT MSVC)
   target_compile_options(espdl_ref PRIVATE -Wall -Wextra)

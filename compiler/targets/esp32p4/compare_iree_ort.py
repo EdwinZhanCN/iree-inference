@@ -7,8 +7,8 @@ the text and measures line accuracy of fp32 and QDQ (ONNX Runtime; IREE is
 compared to it above) on EVAL_LINES synthetic lines whose text is known.
 Synthetic lines check the pipeline; they do not stand in for a real dataset.
 
-With --plugin, IREE loads an executable plugin first (the esp-dl kernel
-imports of a model compiled with espdl/espdl_spec.mlir).
+With --plugin, IREE loads an executable plugin that resolves the esp-dl
+kernel imports emitted by espdl_rewrite.py.
 
 usage: compare_iree_ort.py [--plugin lib] <model.vmfb> <qdq.onnx> <fp32.onnx> <ppq_sim.npy> <det|rec> [inference.yml]
 """

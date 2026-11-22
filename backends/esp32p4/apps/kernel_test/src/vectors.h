@@ -1,4 +1,4 @@
-// Test vectors written by tools/esp/espdl/gen_vectors.py (vectors.c).
+// Test vectors written by gen_vectors.py (vectors.c).
 #pragma once
 
 #include <stdint.h>

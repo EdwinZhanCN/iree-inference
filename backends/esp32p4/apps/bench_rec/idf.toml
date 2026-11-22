@@ -4,9 +4,9 @@ target = "esp32p4"
 idf = "6.0"
 
 [dependencies]
-espdl_p4 = { path = "../../espdl/espdl_p4" }
-iree_runtime = { path = "../iree_runtime" }
-rec_model = { path = "../rec_model" }
+espdl_adapter = { path = "../../components/espdl_adapter" }
+iree_hal_p4 = { path = "../../components/iree_hal_p4" }
+rec_model = { path = "rec_model" }
 
 [config]
 ESP32P4_SELECTS_REV_LESS_V3 = true

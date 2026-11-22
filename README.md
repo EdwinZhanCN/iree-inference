@@ -1,8 +1,12 @@
 # iree-inference
 
-Rust bindings for the inference subset of the IREE runtime C API. The workspace
-contains `iree-sys` (hand-written raw FFI) and `iree-runtime` (safe wrappers).
-It does not provide compiler bindings.
+IREE inference runtime bindings and target-specific model compilation.
+`crates/` contains `iree-sys` (hand-written raw FFI) and `iree-runtime` (safe
+wrappers). `compiler/` contains the offline ESP32-P4 tooling, and `backends/`
+contains the esp-dl adapter, host reference kernels, and ESP-IDF firmware.
+
+See the [architecture](docs/architecture.md) and the [ESP32-P4 backend
+guide](backends/esp32p4/README.md) for the PP-OCRv6 build and regression commands.
 
 The bindings target IREE 3.13.0, commit
 `89ece87b89852100c0a4ac3d515e14842d090967`. Use matching runtime headers,

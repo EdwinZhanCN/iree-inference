@@ -185,9 +185,9 @@ sha256 = "da97440e74a9ff36370bdb598cf421a8183c11ae6fb44431be594ad16dbe77ef"
 size = 46924973
 
 [[component]]
-name = "espdl_p4"
+name = "espdl_adapter"
 version = "*"
-source = "path+/Volumes/CodeBase/iree-inference/tools/esp/espdl/espdl_p4"
+source = "path+/Volumes/CodeBase/iree-inference/backends/esp32p4/components/espdl_adapter"
 
 [[component]]
 name = "espressif/dl_fft"

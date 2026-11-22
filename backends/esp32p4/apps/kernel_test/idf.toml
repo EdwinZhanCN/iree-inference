@@ -4,7 +4,7 @@ target = "esp32p4"
 idf = "6.0"
 
 [dependencies]
-espdl_p4 = { path = "../espdl_p4" }
+espdl_adapter = { path = "../../components/espdl_adapter" }
 
 [config]
 ESP32P4_SELECTS_REV_LESS_V3 = true
