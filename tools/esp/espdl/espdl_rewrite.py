@@ -484,6 +484,8 @@ IMPORTS = {
                   ("params", "i32"), ("y", "i8")],
     "lut_s8": [("x", "i8"), ("table", "i8"), ("params", "i32"), ("y", "i8")],
     "binary_s8": [("a", "i8"), ("b", "i8"), ("params", "i32"), ("y", "i8")],
+    "quant_s8": [("x", "f32"), ("params", "i32"), ("y", "i8")],
+    "dequant_s8_f32": [("x", "i8"), ("params", "i32"), ("y", "f32")],
 }
 
 
@@ -526,13 +528,16 @@ def dense(arr, elem):
     return f'dense<"0x{data.hex().upper()}"> : tensor<{arr.size}x{elem}>'
 
 
-def emit_dispatch(fname, imp, args, consts, out_shape):
+def emit_dispatch(fname, imp, args, consts, out_shape, arg_elems=None, out_elem="i8"):
     """util.func @fname(args...) dispatching import imp. args: shapes of the
-    function's int8 arguments; consts: (array, elem) bound after them."""
+    function's arguments; consts: (array, elem) bound after them."""
     binds = IMPORTS[imp]
-    arg_ts = [tensor_t(a) for a in args]
+    if arg_elems is None:
+        arg_elems = ["i8"] * len(args)
+    arg_ts = [tensor_t(a, e) for a, e in zip(args, arg_elems)]
+    out_t = tensor_t(out_shape, out_elem)
     lines = [f"util.func private @{fname}(" +
-             ", ".join(f"%a{i}: {t}" for i, t in enumerate(arg_ts)) + f") -> {tensor_t(out_shape)} {{"]
+             ", ".join(f"%a{i}: {t}" for i, t in enumerate(arg_ts)) + f") -> {out_t} {{"]
     vals, types, sizes = [f"%a{i}" for i in range(len(args))], list(arg_ts), \
         [int(np.prod(a)) for a in args]
     for k, (arr, elem) in enumerate(consts):
@@ -547,8 +552,8 @@ def emit_dispatch(fname, imp, args, consts, out_shape):
     lines += [f"  %y = flow.dispatch @espdl_executable::@{imp}({', '.join(vals)}, " +
               ", ".join(f"%n{k}" for k in range(len(sizes))) + ") : (" +
               ", ".join(types) + ", " + ", ".join("i32" for _ in sizes) +
-              f") -> {tensor_t(out_shape)}",
-              f"  util.return %y : {tensor_t(out_shape)}", "}"]
+              f") -> {out_t}",
+              f"  util.return %y : {out_t}", "}"]
     return "\n".join(lines)
 
 
@@ -564,6 +569,14 @@ def emit_func(name, m):
         n = int(np.prod(m["k_shape"]))
         return emit_dispatch(name, "lut_s8", [m["k_shape"]],
                              [(m["table"], "i8"), (np.array([n], np.int32), "i32")], m["k_shape"])
+    if m["kind"] == "quant":
+        params = np.array(m["params"], dtype=np.int32)
+        return emit_dispatch(name, "quant_s8", [m["in_shape"]], [(params, "i32")],
+                             m["out_shape"], arg_elems=["f32"], out_elem="i8")
+    if m["kind"] == "dequant":
+        params = np.array(m["params"], dtype=np.int32)
+        return emit_dispatch(name, "dequant_s8_f32", [m["in_shape"]], [(params, "i32")],
+                             m["out_shape"], arg_elems=["i8"], out_elem="f32")
     params = np.array(m["params"], dtype=np.int32)
     return emit_dispatch(name, "binary_s8", [m["k_a_shape"], m["k_b_shape"]],
                          [(params, "i32")], m["k_shape"])
@@ -850,6 +863,83 @@ def dce(module, keep=()):
                     changed = True
 
 
+def rewrite_io_qdq(module, layout):
+    """Replace boundary quantize_affine (+ espdl_to_nhwc) and standalone
+    output dequantize_affine with fast espdl kernels."""
+    extra_live = []
+    to_erase = []
+    for func in list(module.body.operations):
+        func = func.operation
+        if func.name != "util.func" or not len(func.regions[0].blocks):
+            continue
+        for op in list(func.regions[0].blocks[0].operations):
+            op = op.operation
+            if op.name == "iree_linalg_ext.quantize_affine":
+                try:
+                    x_exp = scalar_exp(op)
+                except Skip:
+                    continue
+                xt = ir.RankedTensorType(op.operands[0].type)
+                yt = ir.RankedTensorType(op.results[0].type)
+                if str(xt.element_type) != "f32" or str(yt.element_type) != "i8":
+                    continue
+                maps = [map_kind(a) for a in ir.ArrayAttr(op.attributes["indexing_maps"])]
+                if maps != ["id", "scalar", "id"]:
+                    continue
+                uses = list(op.results[0].uses)
+                if len(uses) != 1 or uses[0].owner.operation.name != "util.call":
+                    continue
+                call_op = uses[0].owner.operation
+                if not str(call_op.attributes["callee"]).startswith("@espdl_to_nhwc_"):
+                    continue
+                s = list(xt.shape)
+                if len(s) not in (3, 4):
+                    continue
+                outer, c, hw = s[0], s[1], int(np.prod(s[2:]))
+                out_shape = shape(call_op.results[0])
+                name = f"espdl_quant_{len(extra_live)}"
+                m = {"kind": "quant", "op": "quant_nhwc", "in_shape": s,
+                     "out_shape": out_shape, "params": [outer, c, hw, x_exp]}
+                with ir.InsertionPoint(call_op):
+                    repl = layout.call(name, op.operands[0], call_op.results[0].type)
+                call_op.results[0].replace_all_uses_with(repl)
+                to_erase.extend([call_op, op])
+                extra_live.append((name, m))
+            elif op.name == "iree_linalg_ext.dequantize_affine":
+                try:
+                    x_exp = scalar_exp(op)
+                except Skip:
+                    continue
+                xt = ir.RankedTensorType(op.operands[0].type)
+                yt = ir.RankedTensorType(op.results[0].type)
+                if str(xt.element_type) != "i8" or str(yt.element_type) != "f32":
+                    continue
+                maps = [map_kind(a) for a in ir.ArrayAttr(op.attributes["indexing_maps"])]
+                if maps != ["id", "scalar", "id"]:
+                    continue
+                uses = list(op.results[0].uses)
+                if not uses or not all(
+                    u.owner.operation.name in ("hal.tensor.barrier", "hal.tensor.export", "util.return")
+                    for u in uses
+                ):
+                    continue
+                s = list(xt.shape)
+                numel = int(np.prod(s))
+                if numel < 1024:
+                    continue
+                name = f"espdl_dequant_{len(extra_live)}"
+                m = {"kind": "dequant", "op": "dequant_f32", "in_shape": s,
+                     "out_shape": list(yt.shape), "params": [numel, x_exp]}
+                with ir.InsertionPoint(op):
+                    repl = layout.call(name, op.operands[0], op.results[0].type)
+                op.results[0].replace_all_uses_with(repl)
+                to_erase.append(op)
+                extra_live.append((name, m))
+    for op in to_erase:
+        op.erase()
+    return extra_live
+
+
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     with ir.Context(), ir.Location.unknown():
@@ -895,13 +985,16 @@ def main():
         layout.finish()
         dce(module)
 
+        io_live = rewrite_io_qdq(module, layout)
         calls = {}
         for op in walk(module.operation):
             if op.name == "util.call":
                 callee = str(op.attributes["callee"])[1:]
                 calls[callee] = calls.get(callee, 0) + 1
         live = [(name, m) for i, (name, (_, m)) in enumerate(zip(names, matches)) if i not in declined]
-        used = sorted({ {"conv": "conv2d_s8", "lut": "lut_s8", "binary": "binary_s8"}[m["kind"]]
+        live.extend(io_live)
+        used = sorted({ {"conv": "conv2d_s8", "lut": "lut_s8", "binary": "binary_s8",
+                         "quant": "quant_s8", "dequant": "dequant_s8_f32"}[m["kind"]]
                         for _, m in live})
         funcs = [emit_func(name, m) for name, m in live]
         funcs += [text for name, text in layout.helpers.items() if name in calls]

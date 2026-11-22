@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "espdl_p4.h"
@@ -27,6 +28,99 @@ extern const uint8_t expected_end[] asm("_binary_expected_bin_end");
 
 #define ENTRY "module.PaddlePaddle Graph in PIR mode"
 #define RUNS 3
+#define MAX_PROF_EXPORTS 16
+
+static const iree_hal_executable_library_v0_t* g_orig_lib = NULL;
+static iree_hal_executable_library_v0_t g_prof_lib;
+static iree_hal_executable_dispatch_v0_t g_prof_ptrs[MAX_PROF_EXPORTS];
+static uint64_t g_disp_cycles[MAX_PROF_EXPORTS];
+static uint32_t g_disp_wg[MAX_PROF_EXPORTS];
+static uint32_t g_disp_calls[MAX_PROF_EXPORTS];
+
+#define DEFINE_TRAMPOLINE(IDX)                                                            \
+  static int prof_dispatch_##IDX(const iree_hal_executable_environment_v0_t* env,         \
+                                 const iree_hal_executable_dispatch_state_v0_t* ds,       \
+                                 const iree_hal_executable_workgroup_state_v0_t* ws) {    \
+    const uint32_t c0 = esp_cpu_get_cycle_count();                                        \
+    const int ret = g_orig_lib->exports.ptrs[IDX](env, ds, ws);                           \
+    const uint32_t dc = esp_cpu_get_cycle_count() - c0;                                   \
+    g_disp_cycles[IDX] += dc;                                                             \
+    ++g_disp_wg[IDX];                                                                     \
+    if (ws->workgroup_id_x == 0 && ws->workgroup_id_y == 0 && ws->workgroup_id_z == 0) {  \
+      ++g_disp_calls[IDX];                                                                \
+    }                                                                                     \
+    return ret;                                                                           \
+  }
+
+DEFINE_TRAMPOLINE(0)
+DEFINE_TRAMPOLINE(1)
+DEFINE_TRAMPOLINE(2)
+DEFINE_TRAMPOLINE(3)
+DEFINE_TRAMPOLINE(4)
+DEFINE_TRAMPOLINE(5)
+DEFINE_TRAMPOLINE(6)
+DEFINE_TRAMPOLINE(7)
+DEFINE_TRAMPOLINE(8)
+DEFINE_TRAMPOLINE(9)
+DEFINE_TRAMPOLINE(10)
+DEFINE_TRAMPOLINE(11)
+DEFINE_TRAMPOLINE(12)
+DEFINE_TRAMPOLINE(13)
+DEFINE_TRAMPOLINE(14)
+DEFINE_TRAMPOLINE(15)
+
+static const iree_hal_executable_dispatch_v0_t kTrampolines[MAX_PROF_EXPORTS] = {
+    prof_dispatch_0,  prof_dispatch_1,  prof_dispatch_2,  prof_dispatch_3,
+    prof_dispatch_4,  prof_dispatch_5,  prof_dispatch_6,  prof_dispatch_7,
+    prof_dispatch_8,  prof_dispatch_9,  prof_dispatch_10, prof_dispatch_11,
+    prof_dispatch_12, prof_dispatch_13, prof_dispatch_14, prof_dispatch_15,
+};
+
+static const iree_hal_executable_library_header_t** prof_library_query(
+    iree_hal_executable_library_version_t max_version,
+    const iree_hal_executable_environment_v0_t* environment) {
+  const iree_hal_executable_library_header_t** hdr =
+      rec_espdl_linked_library_query(max_version, environment);
+  if (!hdr) return NULL;
+  g_orig_lib = (const iree_hal_executable_library_v0_t*)hdr;
+  g_prof_lib = *g_orig_lib;
+  const uint32_t n = g_orig_lib->exports.count;
+  if (n <= MAX_PROF_EXPORTS) {
+    for (uint32_t i = 0; i < n; ++i) g_prof_ptrs[i] = kTrampolines[i];
+    g_prof_lib.exports.ptrs = g_prof_ptrs;
+  }
+  return &g_prof_lib.header;
+}
+
+static uint32_t g_alloc_calls = 0;
+static uint32_t g_free_calls = 0;
+static uint64_t g_alloc_cycles = 0;
+
+static iree_status_t prof_alloc_ctl(void* self, iree_allocator_command_t command,
+                                    const void* params, void** inout_ptr) {
+  (void)self;
+  const uint32_t c0 = esp_cpu_get_cycle_count();
+  const iree_status_t st = iree_allocator_libc_ctl(NULL, command, params, inout_ptr);
+  const uint32_t dc = esp_cpu_get_cycle_count() - c0;
+  g_alloc_cycles += dc;
+  if (command == IREE_ALLOCATOR_COMMAND_MALLOC ||
+      command == IREE_ALLOCATOR_COMMAND_CALLOC ||
+      command == IREE_ALLOCATOR_COMMAND_REALLOC) {
+    ++g_alloc_calls;
+  } else if (command == IREE_ALLOCATOR_COMMAND_FREE) {
+    ++g_free_calls;
+  }
+  return st;
+}
+
+static void reset_dispatch_stats(void) {
+  memset(g_disp_cycles, 0, sizeof(g_disp_cycles));
+  memset(g_disp_wg, 0, sizeof(g_disp_wg));
+  memset(g_disp_calls, 0, sizeof(g_disp_calls));
+  g_alloc_calls = 0;
+  g_free_calls = 0;
+  g_alloc_cycles = 0;
+}
 
 // Import provider: esp-dl kernels by name.
 static iree_status_t resolve_imports(void* self, iree_host_size_t count,
@@ -55,8 +149,35 @@ static iree_status_t resolve_imports(void* self, iree_host_size_t count,
   return iree_ok_status();
 }
 
+static iree_status_t device_slab_alloc_ctl(void* self, iree_allocator_command_t command,
+                                           const void* params, void** inout_ptr) {
+  (void)self;
+  if (command == IREE_ALLOCATOR_COMMAND_CALLOC) {
+    const iree_allocator_alloc_params_t* ap = (const iree_allocator_alloc_params_t*)params;
+    const size_t n = ap->byte_length;
+    if (n == 0) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "allocations must be >0 bytes");
+    }
+    if (n > 256) {
+      // iree_hal_heap_buffer_allocate_slab allocates [aligned header | tensor payload].
+      // Zero only the metadata prefix; skip zero-filling large PSRAM tensor payloads.
+      const uint32_t c0 = esp_cpu_get_cycle_count();
+      void* p = malloc(n);
+      if (p) memset(p, 0, 256);
+      g_alloc_cycles += esp_cpu_get_cycle_count() - c0;
+      ++g_alloc_calls;
+      if (!p) {
+        return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "slab malloc failed");
+      }
+      *inout_ptr = p;
+      return iree_ok_status();
+    }
+  }
+  return prof_alloc_ctl(self, command, params, inout_ptr);
+}
+
 static iree_status_t create_device(iree_allocator_t host_allocator, iree_hal_device_t** out_device) {
-  const iree_hal_executable_library_query_fn_t libraries[] = {rec_espdl_linked_library_query};
+  const iree_hal_executable_library_query_fn_t libraries[] = {prof_library_query};
   const iree_hal_executable_import_provider_t imports = {.self = NULL, .resolve = resolve_imports};
   iree_hal_executable_loader_t* loader = NULL;
   IREE_RETURN_IF_ERROR(iree_hal_static_library_loader_create(
@@ -65,7 +186,8 @@ static iree_status_t create_device(iree_allocator_t host_allocator, iree_hal_dev
   iree_string_view_t identifier = iree_make_cstring_view("local-sync");
   iree_hal_allocator_t* device_allocator = NULL;
   iree_async_proactor_pool_t* proactor_pool = NULL;
-  iree_status_t status = iree_hal_allocator_create_heap(identifier, host_allocator, host_allocator,
+  iree_allocator_t slab_allocator = {.self = NULL, .ctl = device_slab_alloc_ctl};
+  iree_status_t status = iree_hal_allocator_create_heap(identifier, slab_allocator, slab_allocator,
                                                         &device_allocator);
   if (iree_status_is_ok(status)) {
     // No poll-thread runner: one thread, and local-sync works inline.
@@ -116,7 +238,7 @@ static int compare(const float* y, const float* expected, int steps, int classes
 }
 
 static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_t vmfb_size) {
-  iree_allocator_t host_allocator = iree_allocator_system();
+  iree_allocator_t host_allocator = {.self = NULL, .ctl = prof_alloc_ctl};
   const iree_hal_dim_t in_dims[] = MODEL_INPUT_DIMS;
   const iree_hal_dim_t out_dims[] = MODEL_OUTPUT_DIMS;
   const int steps = (int)out_dims[1], classes = (int)out_dims[2];
@@ -175,6 +297,7 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
     iree_hal_buffer_view_release(input);
 
     espdl_p4_reset_stats();
+    reset_dispatch_stats();
     const int64_t t0 = esp_timer_get_time();
     if (iree_status_is_ok(status)) status = iree_runtime_call_invoke(&call, 0);
     const int64_t t1 = esp_timer_get_time();
@@ -195,14 +318,42 @@ static iree_status_t run_case(const char* label, const uint8_t* vmfb_data, size_
     if (iree_status_is_ok(status)) {
       const int64_t total_us = t1 - t0;
       const int64_t espdl_us = st.conv_setup_us + st.conv_kernel_us + st.lut_us +
-                               st.binary_setup_us + st.binary_kernel_us;
+                               st.binary_setup_us + st.binary_kernel_us +
+                               st.quant_us + st.dequant_us;
       printf("run %d: total %lld ms (%lld us) | conv %lu (setup %.2f + kernel %.2f ms) | "
-             "lut %lu (%.2f ms) | bin %lu (setup %.2f + kernel %.2f ms) | iree/other %.2f ms\n",
+             "lut %lu (%.2f ms) | bin %lu (setup %.2f + kernel %.2f ms) | "
+             "q %lu (%.2f ms) | dq %lu (%.2f ms) | iree/other %.2f ms\n",
              r, total_us / 1000, total_us,
              (unsigned long)st.conv_calls, st.conv_setup_us / 1000.0, st.conv_kernel_us / 1000.0,
              (unsigned long)st.lut_calls, st.lut_us / 1000.0,
              (unsigned long)st.binary_calls, st.binary_setup_us / 1000.0, st.binary_kernel_us / 1000.0,
+             (unsigned long)st.quant_calls, st.quant_us / 1000.0,
+             (unsigned long)st.dequant_calls, st.dequant_us / 1000.0,
              (total_us - espdl_us) / 1000.0);
+      if (r == RUNS - 1 && g_orig_lib) {
+        double sum_iree_disp_ms = 0.0;
+        double sum_espdl_disp_ms = 0.0;
+        for (uint32_t i = 0; i < g_orig_lib->exports.count && i < MAX_PROF_EXPORTS; ++i) {
+          const char* name = g_orig_lib->exports.names ? g_orig_lib->exports.names[i] : "?";
+          const double ms = g_disp_cycles[i] / 360000.0;
+          const bool is_espdl = (strcmp(name, "conv2d_s8") == 0 ||
+                                 strcmp(name, "lut_s8") == 0 ||
+                                 strcmp(name, "binary_s8") == 0 ||
+                                 strcmp(name, "quant_s8") == 0 ||
+                                 strcmp(name, "dequant_s8_f32") == 0);
+          if (is_espdl) sum_espdl_disp_ms += ms;
+          else sum_iree_disp_ms += ms;
+          printf("  dispatch[%2lu] %7.2f ms (%3lu calls, %5lu wgs) %s\n",
+                 (unsigned long)i, ms, (unsigned long)g_disp_calls[i],
+                 (unsigned long)g_disp_wg[i], name);
+        }
+        const double vm_hal_ms = (total_us / 1000.0) - sum_iree_disp_ms - sum_espdl_disp_ms;
+        const double alloc_ms = g_alloc_cycles / 360000.0;
+        printf("  summary: espdl_disp %.2f ms (inner %.2f + teardown/glue %.2f) | iree_disp %.2f ms | vm/hal %.2f ms (alloc %.2f ms: %lu alloc, %lu free)\n",
+               sum_espdl_disp_ms, espdl_us / 1000.0, sum_espdl_disp_ms - espdl_us / 1000.0,
+               sum_iree_disp_ms, vm_hal_ms, alloc_ms,
+               (unsigned long)g_alloc_calls, (unsigned long)g_free_calls);
+      }
       ok_runs += compare(y, (const float*)expected_start, steps, classes);
     }
   }

@@ -59,6 +59,26 @@ typedef struct {
   size_t y_offset;
 } espdl_binary_s8_args_t;
 
+// espdl_quant_s8: x (f32), params, y (i8).
+typedef struct {
+  const float* x;
+  size_t x_offset;
+  const int32_t* params;
+  size_t params_offset;
+  int8_t* y;
+  size_t y_offset;
+} espdl_quant_s8_args_t;
+
+// espdl_dequant_s8_f32: x (i8), params, y (f32).
+typedef struct {
+  const int8_t* x;
+  size_t x_offset;
+  const int32_t* params;
+  size_t params_offset;
+  float* y;
+  size_t y_offset;
+} espdl_dequant_s8_f32_args_t;
+
 #ifdef __cplusplus
 }
 #endif

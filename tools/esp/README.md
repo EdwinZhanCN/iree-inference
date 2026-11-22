@@ -54,7 +54,7 @@ esp-dl kernel imports. It runs on IREE's input-phase IR
 (`iree-compile --compile-to=input`), reads the int8 weights, bias and scales
 from the constants, and checks them against esp-dl's scheme: zero point 0,
 power-of-two scales, bias in the accumulator's scale. Ops that fail a check
-stay with IREE. Three imports cover what it replaces:
+stay with IREE. Five imports cover what it replaces:
 
 - `espdl_conv2d_s8`: 1×1 and k×k convolutions (stride, padding, dilation,
   groups), depthwise, 1D convolutions, matrix products with constant
@@ -69,6 +69,11 @@ stay with IREE. Three imports cover what it replaces:
   channel Mul, bias Add), the second one repeating along trailing dims.
   With power-of-two scales the exact integer result rounded half to even
   equals the float QDQ result.
+- `espdl_quant_s8`: boundary `f32 -> i8` quantization (power-of-two scale,
+  round half to even, zero point 0) fused with optional `NCHW -> NHWC`
+  transpose (`[outer, c, hw] -> [outer, hw, c]`).
+- `espdl_dequant_s8_f32`: boundary `i8 -> f32` dequantization
+  (`(float)x[i] * 2^x_exp`) for large model outputs.
 
 The kernels are channels-last (NHWC); the imported model is channels-first.
 The script does not transpose around each kernel. It carries each kernel's
@@ -89,11 +94,12 @@ The import is resolved at run time:
   reference implementations (`espdl/espdl_ref.c`). `espdl/espdl_ref.h` is the
   contract: layouts, parameters, round half to even.
 - On ESP32-P4, `espdl/espdl_p4` (an ESP-IDF component) implements the same
-  imports over esp-dl's `dl::base` kernels, single core. It wraps IREE's
-  buffers in `TensorBase` views without copying: the rewriter already packs
-  weights in esp-dl's ESP32-P4 filter layout (blocks of 16 output channels,
-  as ESP-PPQ exports them), and `espdl/espdl_imports.h` holds the argument
-  structs both backends unpack.
+  imports over esp-dl's `dl::base` kernels and RV32F helpers, single core. It
+  wraps IREE's buffers without copying (with a 128-slot `ConvArgsType`
+  setup cache for `conv2d_s8` and stack-built args for `binary_s8`): the
+  rewriter already packs weights in esp-dl's ESP32-P4 filter layout (blocks
+  of 16 output channels, as ESP-PPQ exports them), and `espdl/espdl_imports.h`
+  holds the argument structs both backends unpack.
 
 ```sh
 just esp-ppocr-espdl rec   # host: IREE + reference kernels vs ORT
@@ -103,14 +109,16 @@ just esp-ppocr-p4 rec iree # P4 static library, IREE codegen only
 
 | Model | Ops to esp-dl | Transposes left | Host result | P4 `.text` |
 | --- | --- | --- | --- | --- |
-| rec | 72: 38 conv/MatMul, 22 LUT, 12 Add/Mul | 3 | bit-exact with ORT and ESP-PPQ | 18 KiB (IREE only: 7,763 KiB) |
+| rec | 74: 38 conv/MatMul, 22 LUT, 12 Add/Mul, 1 quant_nhwc, 1 dequant_f32 | 2 | bit-exact with ORT and ESP-PPQ | 16 KiB (IREE only: 7,763 KiB) |
 | det | 162: 85 conv, 42 LUT, 35 Add/Mul | 7 | bit-exact with ORT and ESP-PPQ | 58 KiB |
 
 What stays with IREE: the global average pools of the SE blocks and
 AveragePool (reductions), Resize, Concat, MaxPool, the two ConvTranspose of
 det (lowered `InsertZeros`), and rec's float depthwise Conv1D after the
-AveragePool (its input is not quantized in the export). The transposes left
-are the model input and output, and around those last two.
+AveragePool (its input is not quantized in the export). On rec, the model
+input `quantize_affine + to_nhwc` and model output `dequantize_affine` are
+handled by `espdl_quant_s8` and `espdl_dequant_s8_f32`; the 2 remaining
+transposes wrap the unquantized float depthwise Conv1D.
 
 `just esp-p4-kernel-test` checks the ESP32-P4 backend on a board. It takes
 every kernel configuration of both models (spatial sizes cropped), fills it
@@ -127,3 +135,48 @@ Known workarounds:
   crashes on Apple Silicon when it lowers i8mm contractions for rec.
 - ESP32-P4 uses the static-library mode. The embedded-ELF mode cannot
   resolve `__fixsfdi` for det, which needs it for Resize coordinates.
+
+## ESP32-P4 `rec` optimization log
+
+Measured on ESP32-P4 rev 1.3 @ 360 MHz (`firmware/rec_p4`), warm runs (run 1–2),
+`0 of 276240` output values differing from host across all stages:
+
+| Stage | Flash XIP | PSRAM Copy | Key change |
+| --- | --- | --- | --- |
+| Baseline (`-Og`) | ~456 ms | 267.8 ms | Initial `esp-dl` integration |
+| Compiler `-O2` | ~456 ms | 265.9 ms | `COMPILER_OPTIMIZATION_PERF = true` in `rec_p4/idf.toml` |
+| Slab `calloc` bypass + setup elimination | 390.2 ms | 199.95 ms | `alloc` `19.64 -> 0.16 ms`; `conv/bin` setup `27.77 -> 1.56 ms` |
+| Boundary `quant_s8` + `dequant_s8_f32` | **376.3 ms** | **185.4 ms** | `quant` `10.84 -> 4.26 ms`; `dequant` `23.54 -> 15.49 ms` |
+
+Total PSRAM-copy speedup: **-82.4 ms (-30.8%)**.
+
+Details of the three optimizations:
+
+1. **Skip PSRAM payload zero-fill in HAL heap slab allocator (`firmware/rec_p4/src/main.c`)**:
+   `iree_hal_allocator_create_heap` zeroes ~1.88 MiB of temporary and output PSRAM buffers per run
+   via `IREE_ALLOCATOR_COMMAND_CALLOC`. Passing the custom `device_slab_alloc_ctl` as both
+   `data_allocator` and `host_allocator` (single-allocator `SLAB` mode, avoiding upstream
+   `buffer_heap.c`'s `SPLIT`-mode aligned-alloc / unaligned-free mismatch) lets allocations `> 256` B
+   use `malloc` and only `memset` the first 256-byte metadata header. This cut `alloc/free` from
+   `19.64 ms` to `0.17 ms` and reduced L2 cache pollution across subsequent dispatches.
+2. **Eliminate per-layer heap/setup overhead in `espdl_p4` (`espdl/espdl_p4/espdl_p4.cpp`)**:
+   - `espdl_p4_binary_s8`: constructs `dl::base::elemwiseArgsType<int8_t>` directly on the stack
+     with zero `TensorBase` or `std::vector` heap allocations (`4.60 -> 0.57 ms` setup).
+   - `espdl_p4_conv2d_s8`: caches resolved `ConvArgsType` + kernel pointers in a 128-slot open-address
+     table keyed by `(w, bias, w_exp, p)` and `params` (`23.17 -> 0.50 ms` warm setup). On cache hit,
+     `base_args` is copied to the stack before updating `input_element`/`output_element` because
+     `esp-dl`'s border/grid loops mutate `ConvArgsType` in place.
+3. **Move boundary `quantize_affine` and `dequantize_affine` to `espdl` kernels**:
+   - `espdl_quant_s8`: fuses the `1x3x48x320` input `quantize_affine` and `NCHW -> NHWC` transpose,
+     using RV32F's single-instruction `fcvt.w.s ..., rne` (exact match for MLIR `math.roundeven`)
+     and packing 4 RGB pixels into 3 aligned `uint32_t` stores (`10.84 -> 4.26 ms`).
+   - `espdl_dequant_s8_f32`: precomputes a 256-entry `float` LUT (`1 KiB`, L1-resident) on the stack
+     and writes the `1x40x6906` (`1.05 MiB`) output via 4x unrolled table lookups (`23.54 -> 15.49 ms`,
+     bound by PSRAM write-allocate + writeback bandwidth).
+
+Warm PSRAM-copy breakdown (`186.19 ms`, run 2):
+- `espdl` dispatches (74 calls): `156.84 ms` (`conv2d_s8` 100.76 + 0.51 setup, `lut_s8` 19.74,
+  `dequant_s8_f32` 15.48, `binary_s8` 12.64 + 0.61 setup, `quant_s8` 4.29, glue 2.82)
+- Remaining IREE dispatches (6 calls): `10.04 ms` (3 SE reductions 2.56, `pooling_nhwc_sum` 4.28,
+  float `depthwise_conv1d` 3.11, `transpose` 0.09)
+- IREE VM + HAL scheduling: `19.31 ms` (`alloc` `0.17 ms`)

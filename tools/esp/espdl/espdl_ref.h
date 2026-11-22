@@ -88,6 +88,27 @@ enum { ESPDL_BINARY_ADD = 0, ESPDL_BINARY_MUL = 1 };
 int espdl_ref_binary_s8(const int8_t* a, const int8_t* b, const int32_t* params,
                         int8_t* y);
 
+// Parameters of espdl_ref_quant_s8: quantize [outer, c, hw] f32 -> [outer, hw, c] i8.
+// When c == 1 or hw == 1, this is a flat elementwise quantization.
+enum {
+  ESPDL_QUANT_OUTER = 0,
+  ESPDL_QUANT_C,
+  ESPDL_QUANT_HW,
+  ESPDL_QUANT_X_EXP,  // output scale 2^x_exp (quantizes by * 2^-x_exp)
+  ESPDL_QUANT_PARAM_COUNT,
+};
+
+int espdl_ref_quant_s8(const float* x, const int32_t* params, int8_t* y);
+
+// Parameters of espdl_ref_dequant_s8_f32: y[i] = (float)x[i] * 2^x_exp.
+enum {
+  ESPDL_DEQUANT_N = 0,
+  ESPDL_DEQUANT_X_EXP,
+  ESPDL_DEQUANT_PARAM_COUNT,
+};
+
+int espdl_ref_dequant_s8_f32(const int8_t* x, const int32_t* params, float* y);
+
 #ifdef __cplusplus
 }
 #endif

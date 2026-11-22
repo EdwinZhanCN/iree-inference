@@ -36,6 +36,22 @@ static int espdl_binary_s8(void* args_ptr, void* context, void* reserved) {
                              a->params + a->params_offset, a->y + a->y_offset);
 }
 
+static int espdl_quant_s8(void* args_ptr, void* context, void* reserved) {
+  (void)context;
+  (void)reserved;
+  const espdl_quant_s8_args_t* a = (const espdl_quant_s8_args_t*)args_ptr;
+  return espdl_ref_quant_s8(a->x + a->x_offset, a->params + a->params_offset,
+                            a->y + a->y_offset);
+}
+
+static int espdl_dequant_s8_f32(void* args_ptr, void* context, void* reserved) {
+  (void)context;
+  (void)reserved;
+  const espdl_dequant_s8_f32_args_t* a = (const espdl_dequant_s8_f32_args_t*)args_ptr;
+  return espdl_ref_dequant_s8_f32(a->x + a->x_offset, a->params + a->params_offset,
+                                  a->y + a->y_offset);
+}
+
 typedef struct {
   const char* name;
   espdl_import_fn_t fn;
@@ -45,6 +61,8 @@ static const espdl_import_t kImports[] = {
     {"espdl_conv2d_s8", espdl_conv2d_s8},
     {"espdl_lut_s8", espdl_lut_s8},
     {"espdl_binary_s8", espdl_binary_s8},
+    {"espdl_quant_s8", espdl_quant_s8},
+    {"espdl_dequant_s8_f32", espdl_dequant_s8_f32},
 };
 
 static iree_hal_executable_plugin_status_t espdl_plugin_load(

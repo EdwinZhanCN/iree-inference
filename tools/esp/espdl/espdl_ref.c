@@ -1,5 +1,8 @@
 #include "espdl_ref.h"
 
+#include <math.h>
+#include <stddef.h>
+
 // v * 2^-shift rounded half to even (shift > 0), or v * 2^-shift (shift <= 0).
 static int64_t requantize(int64_t v, int shift) {
   if (shift <= 0) return v * ((int64_t)1 << -shift);
@@ -99,6 +102,43 @@ int espdl_ref_binary_s8(const int8_t* a, const int8_t* b, const int32_t* p,
     for (int32_t i = 0; i < n; ++i) {
       y[i] = saturate_s8(requantize((int64_t)a[i] * b[i % bl], ey - ea - eb));
     }
+  }
+  return ESPDL_OK;
+}
+
+static int8_t quant_rne_s8(float v, float inv_scale) {
+  float s = v * inv_scale;
+  if (s < -128.0f) s = -128.0f;
+  if (s > 127.0f) s = 127.0f;
+  return (int8_t)lrintf(s);
+}
+
+int espdl_ref_quant_s8(const float* x, const int32_t* p, int8_t* y) {
+  const int32_t outer = p[ESPDL_QUANT_OUTER];
+  const int32_t c = p[ESPDL_QUANT_C];
+  const int32_t hw = p[ESPDL_QUANT_HW];
+  const int x_exp = p[ESPDL_QUANT_X_EXP];
+  if (outer <= 0 || c <= 0 || hw <= 0) return ESPDL_ERR_SHAPE;
+  const float inv_scale = ldexpf(1.0f, -x_exp);
+  for (int32_t o = 0; o < outer; ++o) {
+    const float* xo = x + (size_t)o * c * hw;
+    int8_t* yo = y + (size_t)o * hw * c;
+    for (int32_t i = 0; i < hw; ++i) {
+      for (int32_t ch = 0; ch < c; ++ch) {
+        yo[(size_t)i * c + ch] = quant_rne_s8(xo[(size_t)ch * hw + i], inv_scale);
+      }
+    }
+  }
+  return ESPDL_OK;
+}
+
+int espdl_ref_dequant_s8_f32(const int8_t* x, const int32_t* p, float* y) {
+  const int32_t n = p[ESPDL_DEQUANT_N];
+  const int x_exp = p[ESPDL_DEQUANT_X_EXP];
+  if (n < 0) return ESPDL_ERR_SHAPE;
+  const float scale = ldexpf(1.0f, x_exp);
+  for (int32_t i = 0; i < n; ++i) {
+    y[i] = (float)x[i] * scale;
   }
   return ESPDL_OK;
 }
