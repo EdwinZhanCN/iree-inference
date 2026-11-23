@@ -1,11 +1,12 @@
-"""Check MLX steel GEMM kernels called through hal.dispatch.extern on Metal.
+"""Check MLX steel kernels called through hal.dispatch.extern on Metal.
 
-For each shape, builds a module with one extern dispatch, compiles it with a
-patched iree-compile (external Metal variants), checks it against NumPy, and
-reports the median call time from iree-benchmark-module.
+For each GEMM shape, builds a module with one extern dispatch, compiles it
+with a patched iree-compile (external Metal variants), checks it against NumPy
+and IREE's own matmul, and reports the median call time from
+iree-benchmark-module. Attention shapes are checked against NumPy only.
 
-  test_mlx_gemm.py <iree-compile> <mlx_gemm.metallib> <work_dir>
-      [--shape MxNxK[:nt]]...
+  test_mlx_kernels.py <iree-compile> <mlx_kernels.metallib> <work_dir>
+      [--shape MxNxK[:nt]]... [--attention BxLxHxD]...
 """
 import argparse
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 import mlx_kernels
-from mlx_kernels import METAL_TARGET, gemm_extern, kernel_name
+from mlx_kernels import METAL_TARGET, attention_extern, gemm_extern, kernel_name
 
 BIN = Path(sys.executable).parent
 
@@ -35,6 +36,40 @@ module attributes {{hal.device.targets = [#device]}} {{
   }}
 }}
 """
+
+
+def attention_module(b, l, h, d, metallib):
+    body, t = attention_extern("%q", "%k", "%v", b, l, h, d, metallib)
+    lines = "\n".join(body)
+    return f"""
+#metal_target = {METAL_TARGET}
+#device = #hal.device.target<"metal", [#metal_target]> : !hal.device
+module attributes {{hal.device.targets = [#device]}} {{
+  func.func @main(%q: {t}, %k: {t}, %v: {t}) -> {t} {{
+{lines}
+    return %o : {t}
+  }}
+}}
+"""
+
+
+def check_attention(rt, iree_compile, metallib, work_dir, spec):
+    """MLX attention on [B, L, H*D] q, k, v against NumPy; True when it matches."""
+    b, l, h, d = (int(x) for x in spec.split("x"))
+    stem = work_dir / f"attention_{spec}"
+    stem.with_suffix(".mlx.mlir").write_text(attention_module(b, l, h, d, metallib))
+    subprocess.run([iree_compile, stem.with_suffix(".mlx.mlir"), "-o", stem.with_suffix(".mlx.vmfb")], check=True)
+    rng = np.random.default_rng(0)
+    q, k, v = (rng.standard_normal((b, l, h * d)).astype(np.float16) for _ in range(3))
+    heads = lambda x: x.astype(np.float32).reshape(b, l, h, d).transpose(0, 2, 1, 3)
+    s = heads(q) @ heads(k).transpose(0, 1, 3, 2) / np.sqrt(d)
+    p = np.exp(s - s.max(-1, keepdims=True))
+    want = ((p / p.sum(-1, keepdims=True)) @ heads(v)).transpose(0, 2, 1, 3).reshape(b, l, h * d)
+    got = run_module(rt, stem.with_suffix(".mlx.vmfb"), q, k, v)
+    err = float(np.abs(got - want).max() / np.abs(want).max())
+    good = err < 5e-3
+    print(f"attention {spec:12s} max rel err: mlx {err:.1e} ({'ok' if good else 'FAIL'})")
+    return good
 
 
 def baseline_module(m, n, k, nt):
@@ -78,16 +113,21 @@ def main():
     p.add_argument("work_dir", type=Path)
     p.add_argument("--shape", action="append",
                    help="MxNxK, with :nt for a transposed B (default: the BioCLIP 2 shapes and one unaligned shape)")
-    p.add_argument("--nt-tile", help="BMxBNxBKxWMxWN for nt kernels (default: mlx_kernels.TILES)")
+    p.add_argument("--attention", action="append",
+                   help="BxLxHxD (default: BioCLIP 2's and one with L a multiple of the tile)")
+    p.add_argument("--arch", help="Metal GPU architecture to pick MLX tiles for (default: this machine's GPU)")
     a = p.parse_args()
-    if a.nt_tile:
-        mlx_kernels.TILES["nt"] = tuple(int(x) for x in a.nt_tile.split("x"))
+    mlx_kernels.set_arch(a.arch or mlx_kernels.detect_arch())
     # The model's weights reach the dispatch as KxN, so nn.
     a.shape = a.shape or ["257x1024x1024", "257x4096x1024", "257x1024x4096", "100x96x40", "257x1024x1024:nt"]
+    a.work_dir = a.work_dir.resolve()
     a.work_dir.mkdir(parents=True, exist_ok=True)
     import iree.runtime as rt
 
+    a.attention = a.attention or ["1x257x16x64", "2x64x4x64"]
     ok = True
+    for spec in a.attention:
+        ok &= check_attention(rt, a.iree_compile, a.metallib.resolve(), a.work_dir, spec)
     for spec in a.shape:
         dims, _, mode = spec.partition(":")
         m, n, k = (int(x) for x in dims.split("x"))
@@ -114,7 +154,7 @@ def main():
         us = {name: bench_us(vmfb, a.work_dir, stem.name) for name, vmfb in (("mlx", mlx_vmfb), ("iree", base_vmfb))}
         good = err["mlx"] < 2e-3
         ok &= good
-        print(f"{spec:18s} {kernel_name(m, n, k, nt)}\n"
+        print(f"{spec:18s} {kernel_name(1, m, n, k, nt)}\n"
               f"    max rel err: mlx {err['mlx']:.1e} ({'ok' if good else 'FAIL'}), iree {err['iree']:.1e}\n"
               f"    call median: mlx {us['mlx'] / 1e3:.3f} ms, iree {us['iree'] / 1e3:.3f} ms "
               f"({us['iree'] / us['mlx']:.1f}x)")

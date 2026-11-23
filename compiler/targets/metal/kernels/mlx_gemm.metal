@@ -12,9 +12,10 @@
 //   D[z] = op(A[z]) * op(B[z]),  op = transpose when the kernel name says t
 //   bindings: 0 = A, 1 = B, 2 = D
 //   constants: M, N, K, lda, ldb, ldd, batch_stride_a, batch_stride_b,
-//              batch_stride_d (elements; batch stride 0 broadcasts)
-//   threadgroup: (32, WN, WM); grid: (tiles_n << swizzle, ceil(tiles_m >>
-//   swizzle), batch)
+//              batch_stride_d (elements; batch stride 0 broadcasts),
+//              swizzle_log
+//   threadgroup: (32, WN, WM); grid: (tiles_n << swizzle_log,
+//   ceil(tiles_m >> swizzle_log), batch)
 
 #include <metal_stdlib>
 
@@ -35,9 +36,8 @@ struct GemmConstants {
   int M, N, K;
   int lda, ldb, ldd;
   int batch_stride_a, batch_stride_b, batch_stride_d;
+  int swizzle_log;
 };
-
-constant constexpr int kSwizzleLog = 2;
 
 template <
     typename T,
@@ -65,9 +65,9 @@ template <
 
   const int tiles_n = (c.N + BN - 1) / BN;
   const int tiles_m = (c.M + BM - 1) / BM;
-  const int tid_y = (int(tid.y) << kSwizzleLog) +
-      (int(tid.x) & ((1 << kSwizzleLog) - 1));
-  const int tid_x = int(tid.x) >> kSwizzleLog;
+  const int tid_y = (int(tid.y) << c.swizzle_log) +
+      (int(tid.x) & ((1 << c.swizzle_log) - 1));
+  const int tid_x = int(tid.x) >> c.swizzle_log;
   if (tiles_n <= tid_x || tiles_m <= tid_y) {
     return;
   }
@@ -167,8 +167,13 @@ template <
   instantiate_gemm(tname, ta, tb, bm, bn, bk, wm, wn, false, false, true, "uua") \
   instantiate_gemm(tname, ta, tb, bm, bn, bk, wm, wn, false, false, false, "uuu")
 
-// nn: MLX's choice for medium devices (M1/M2/M3 Pro and Max: applegpu_g1Xs).
-instantiate_gemm_alignments(nn, false, false, 64, 64, 16, 2, 2)
-// nt: fastest on an M2 Pro for the BioCLIP 2 linears (M = 257) among MLX's
-// presets and a few BM = 32 tiles; see mlx_kernels.TILES.
-instantiate_gemm_alignments(nt, false, true, 32, 32, 32, 2, 2)
+// Every f16 tile MLX's GEMM_TPARAM_MACRO can pick (mlx_kernels.gemm_tile),
+// for both layouts.
+#define instantiate_gemm_tiles(tname, ta, tb)                    \
+  instantiate_gemm_alignments(tname, ta, tb, 64, 64, 16, 2, 2)   \
+  instantiate_gemm_alignments(tname, ta, tb, 64, 64, 16, 1, 2)   \
+  instantiate_gemm_alignments(tname, ta, tb, 64, 32, 32, 2, 2)   \
+  instantiate_gemm_alignments(tname, ta, tb, 32, 64, 16, 1, 2)
+
+instantiate_gemm_tiles(nn, false, false)
+instantiate_gemm_tiles(nt, false, true)

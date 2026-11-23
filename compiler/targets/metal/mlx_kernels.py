@@ -1,4 +1,7 @@
-"""Route GEMMs to MLX steel kernels (kernels/mlx_gemm.metal) on IREE Metal.
+"""Route GEMMs and attention to MLX steel kernels on IREE Metal.
+
+The kernels are kernels/mlx_gemm.metal and kernels/mlx_attention.metal,
+linked into one metallib.
 
 Writes a preprocessing transform spec (--iree-preprocessing-transform-spec-
 filename) that replaces each `fill(0.0 : f32)` + `linalg.batch_matmul` of
@@ -13,9 +16,18 @@ External Metal variants need the patched MetalSPIRV target.
 A --linear rule also takes in the transpose and batch-1 broadcast of a
 torch linear's weight and uses the nt kernel on the original weight.
 
-  mlx_kernels.py <mlx_gemm.metallib> <spec.mlir> [--linear MxNxK]... [--gemm BxMxNxK]...
+An --attention rule replaces torch's multi-head attention as it reaches
+preprocessing: q, k and v [B, L, H*D] split into heads and transposed to
+[B*H, L, D], iree_linalg_ext.attention with scale D^-0.5, and the transpose
+back. MLX's kernel reads and writes [B, L, H, D] through strides, so none of
+the transposes remain.
+
+  mlx_kernels.py <mlx_kernels.metallib> <spec.mlir> [--linear MxNxK]...
+      [--gemm BxMxNxK]... [--attention BxLxHxD]...
 """
 import argparse
+import struct
+import subprocess
 from pathlib import Path
 
 # The default Metal executable target of iree-compile 3.13; objects are keyed
@@ -28,23 +40,103 @@ METAL_TARGET = (
     "max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 32768, "
     "max_workgroup_counts = [65535, 65535, 65535]>>}>"
 )
-# (BM, BN, BK, WM, WN) per layout; must be instantiated in mlx_gemm.metal.
-# nn is MLX's choice for medium Apple GPUs (M1/M2/M3 Pro and Max). For nt,
-# 32x32x32 was the fastest on an M2 Pro for the BioCLIP 2 linears (M = 257)
-# among MLX's presets (64x64x16, 64x32x32, 32x64x16) and 32x32x16, 32x64x32,
-# 64x64x32: the three linear shapes take 42.0 ms per encoder call against
-# 47.8 ms with 64x32x32 and BM = 32 wastes less of the last tile row.
-TILES = {"nn": (64, 64, 16, 2, 2), "nt": (32, 32, 32, 2, 2)}
-SWIZZLE = 2
 ALIGNMENTS = {"aaa", "uaa", "aua", "uua"}  # instantiated, plus "uuu"
 
 
-def kernel_name(m, n, k, nt=False):
-    layout = "nt" if nt else "nn"
-    bm, bn, bk, wm, wn = TILES[layout]
+def detect_arch():
+    """The local GPU's Metal architecture name, e.g. applegpu_g14s."""
+    out = subprocess.run(["xcrun", "swift", "-e",
+                          "import Metal; print(MTLCreateSystemDefaultDevice()!.architecture.name)"],
+                         check=True, text=True, capture_output=True).stdout
+    return out.strip().splitlines()[-1]
+
+
+# MLX picks tiles at run time from the last letter of the architecture name
+# (its device class: g and p small, d large, the rest medium). IREE compiles
+# ahead of time, so the spec is written for one architecture: this machine's
+# by default, or the one given for a cross-compile.
+DEVICE_CLASS = None  # set with set_arch()
+
+
+def set_arch(arch):
+    global DEVICE_CLASS
+    DEVICE_CLASS = arch[-1]
+
+
+def gemm_tile(batch, m, n, k, nt):
+    """(BM, BN, BK, WM, WN) for an f16 GEMM, as MLX's GEMM_TPARAM_MACRO
+    (mlx/backend/metal/matmul.cpp) chooses it. All of them are instantiated
+    in mlx_gemm.metal."""
+    devc = DEVICE_CLASS
+    assert devc, "call set_arch() first"
+    if devc in "gp":
+        return (64, 32, 32, 2, 2) if nt else (64, 64, 16, 1, 2)
+    if devc == "d":
+        if batch * m * n >= 1 << 20:
+            if 2 * max(m, n) > k:
+                return (64, 64, 16, 1, 2)
+            return (64, 32, 32, 2, 2) if nt else (32, 64, 16, 1, 2)
+        return (64, 32, 32, 2, 2) if nt else (64, 64, 16, 1, 2)
+    return (64, 64, 16, 2, 2)
+
+
+# MLX's regular (non-NAX) steel GEMM dispatch uses no threadgroup swizzle.
+SWIZZLE = 0
+
+
+def kernel_name(batch, m, n, k, nt=False):
+    bm, bn, bk, wm, wn = gemm_tile(batch, m, n, k, nt)
     align = "".join("a" if d % t == 0 else "u" for d, t in ((m, bm), (n, bn), (k, bk)))
     align = align if align in ALIGNMENTS else "uuu"
-    return f"mlx_gemm_{layout}_f16_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_{align}"
+    return f"mlx_gemm_{'nt' if nt else 'nn'}_f16_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_{align}"
+
+
+def attention_tile(d):
+    """(BQ, BK, BD, BV, WM, WN) as MLX's sdpa_full (non-NAX) chooses it for
+    f16 and head dim d; instantiated in mlx_attention.metal for d = 64."""
+    devc = DEVICE_CLASS
+    bk = 32 if (d == 256 and devc == "d") or d < 128 else 16
+    tile = (32, bk, d, d, 4, 2 if d == 256 else 1)
+    assert d == 64, f"no attention kernel instantiated for head dim {d}"
+    return tile
+
+
+def attention_extern(q, k, v, b, l, h, d, metallib, result="%o", indent="    "):
+    """MLIR lines computing `result` = attention(q, k, v) for [B, L, H*D]
+    tensors with scale D^-0.5. Returns (lines, result type)."""
+    bq, bk, bd, bv, wm, wn = attention_tile(d)
+    align = ("a" if l % bq == 0 else "u") + ("a" if l % bk == 0 else "u")
+    name = f"mlx_attention_f16_bq{bq}_bk{bk}_bd{bd}_bv{bv}_wm{wm}_wn{wn}_{align}"
+    t = f"tensor<{b}x{l}x{h * d}xf16>"
+    scale_bits = int.from_bytes(struct.pack("<f", d ** -0.5), "little")
+    strides = [l * h * d, d, h * d]  # batch, head, row of [B, L, H, D]
+    consts = [b, h, d, l, l, scale_bits] + strides * 4
+    lines = [f"%c{i} = arith.constant {v} : i32" for i, v in enumerate(consts)]
+    lines += [f"%w{i} = arith.constant {v} : index" for i, v in enumerate((b, l, h, d))]
+    args = ", ".join(f"%c{i}" for i in range(len(consts)))
+    types = ", ".join("i32" for _ in consts)
+    lines += [
+        f'{result} = hal.dispatch.extern "{name}"[%w0, %w1, %w2, %w3]({args}, {q}, {k}, {v})',
+        f"    : ({types}, {t}, {t}, {t}) -> {t}",
+        "  count(%device: !hal.device, %wb: index, %wl: index, %wh: index, %wd: index)"
+        " -> (index, index, index) {",
+        f"    %x = arith.constant {-(-l // bq)} : index",
+        f"    %y = arith.constant {h} : index",
+        f"    %z = arith.constant {b} : index",
+        "    hal.return %x, %y, %z : index, index, index",
+        "  }",
+        f"  layout(#hal.pipeline.layout<constants = {len(consts)}, bindings = [",
+        "    #hal.pipeline.binding<storage_buffer, ReadOnly>,",
+        "    #hal.pipeline.binding<storage_buffer, ReadOnly>,",
+        "    #hal.pipeline.binding<storage_buffer, ReadOnly>,",
+        "    #hal.pipeline.binding<storage_buffer>",
+        "  ]>)",
+        "  objects({",
+        f'    #metal_target ordinal(0) = [#hal.executable.object<{{path = "{metallib}"}}>]',
+        "  })",
+        f"  <{{workgroup_size = [32 : index, {wm} : index, {wn} : index]}}>",
+    ]
+    return [indent + line for line in lines], t
 
 
 def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=None, indent="    "):
@@ -54,10 +146,10 @@ def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=No
     a_type = a_type or f"tensor<{prefix}{m}x{k}xf16>"
     b_type = b_type or (f"tensor<{prefix}{n}x{k}xf16>" if nt else f"tensor<{prefix}{k}x{n}xf16>")
     d_type = f"tensor<{prefix}{m}x{n}xf16>"
-    bm, bn, _, wm, wn = TILES["nt" if nt else "nn"]
+    bm, bn, _, wm, wn = gemm_tile(batch or 1, m, n, k, nt)
     tiles_m, tiles_n = -(-m // bm), -(-n // bn)
     grid = (tiles_n << SWIZZLE, -(-tiles_m // (1 << SWIZZLE)), batch or 1)
-    consts = [m, n, k, k, k if nt else n, n, m * k, n * k, m * n]
+    consts = [m, n, k, k, k if nt else n, n, m * k, n * k, m * n, SWIZZLE]
     lines = [f"%c{i} = arith.constant {v} : i32" for i, v in enumerate(consts)]
     # The workload is the problem size. The grid does not need it, but IREE
     # keys per-dispatch benchmarks on it, so each shape is benchmarked on its
@@ -67,7 +159,7 @@ def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=No
     args = ", ".join(f"%c{i}" for i in range(len(consts)))
     types = ", ".join("i32" for _ in consts)
     lines += [
-        f'%d = hal.dispatch.extern "{kernel_name(m, n, k, nt)}"[%w0, %w1, %w2, %w3]({args}, {a}, {b})',
+        f'%d = hal.dispatch.extern "{kernel_name(batch or 1, m, n, k, nt)}"[%w0, %w1, %w2, %w3]({args}, {a}, {b})',
         f"    : ({types}, {a_type}, {b_type}) -> {d_type}",
         "  count(%device: !hal.device, %wb: index, %wm: index, %wn: index, %wk: index)"
         " -> (index, index, index) {",
@@ -160,6 +252,36 @@ def linear_rule(m, n, k, metallib):
     ], body + [f"    %r = arith.extf %d : {d_type} to {acc}"], acc)
 
 
+def attention_rule(b, l, h, d, metallib):
+    """q, k, v [b, l, h*d] -> heads [b*h, l, d] -> attention -> [b, l, h*d]."""
+    t, heads = f"tensor<{b}x{l}x{h * d}xf16>", f"tensor<{b}x{l}x{h}x{d}xf16>"
+    bh, flat = f"tensor<{b}x{h}x{l}x{d}xf16>", f"tensor<{b * h}x{l}x{d}xf16>"
+    maps = ", ".join(f"affine_map<(d0, d1, d2, d3, d4) -> ({x})>"
+                     for x in ("d0, d1, d3", "d0, d4, d3", "d0, d4, d2", "", "d0, d1, d2"))
+    dag = []
+    for x in "qkv":
+        dag += [
+            f"%{x}e = tensor.expand_shape %{x} [[0], [1], [2, 3]] output_shape [{b}, {l}, {h}, {d}]"
+            f" : {t} into {heads}",
+            f"%{x}t = linalg.transpose ins(%{x}e : {heads}) outs(%heads_init : {bh}) permutation = [0, 2, 1, 3]",
+            f"%{x}c = tensor.collapse_shape %{x}t [[0, 1], [2], [3]] : {bh} into {flat}",
+        ]
+    dag += [
+        f"%scale = arith.constant {d ** -0.5:e} : f16",
+        f"%a = iree_linalg_ext.attention <indexing_maps = [{maps}]>"
+        f" ins(%qc, %kc, %vc, %scale : {flat}, {flat}, {flat}, f16) outs(%attn_init : {flat}) {{",
+        "^bb0(%s: f32):",
+        "  iree_linalg_ext.yield %s : f32",
+        f"}} -> {flat}",
+        f"%ae = tensor.expand_shape %a [[0, 1], [2], [3]] output_shape [{b}, {h}, {l}, {d}] : {flat} into {bh}",
+        f"%at = linalg.transpose ins(%ae : {bh}) outs(%back_init : {heads}) permutation = [0, 2, 1, 3]",
+        f"%out = tensor.collapse_shape %at [[0], [1], [2, 3]] : {heads} into {t}",
+    ]
+    body, _ = attention_extern("%q", "%k", "%v", b, l, h, d, metallib, result="%r")
+    args = [("q", t), ("k", t), ("v", t), ("heads_init", bh), ("attn_init", flat), ("back_init", heads)]
+    return rule(f"mlx_attention_{b}x{l}x{h}x{d}", args, dag, body, t)
+
+
 def spec(rules):
     helpers, sequences, matches = zip(*rules)
     return f"""// Generated by compiler/targets/metal/mlx_kernels.py.
@@ -192,12 +314,18 @@ def main():
     p.add_argument("--linear", action="append", default=[],
                    help="MxNxK of a bias-free torch linear (transposed weight) to replace; tried first")
     p.add_argument("--gemm", action="append", default=[], help="BxMxNxK of a batch_matmul to replace")
+    p.add_argument("--attention", action="append", default=[],
+                   help="BxLxHxD of a torch multi-head attention (scale D^-0.5) to replace")
+    p.add_argument("--arch", help="Metal GPU architecture to pick MLX tiles for, e.g. applegpu_g14s "
+                   "(default: this machine's GPU)")
     a = p.parse_args()
+    set_arch(a.arch or detect_arch())
     lib = a.metallib.resolve()
     shape = lambda s: tuple(int(x) for x in s.split("x"))
-    rules = [linear_rule(*shape(s), lib) for s in a.linear] + [gemm_rule(*shape(s), lib) for s in a.gemm]
+    rules = ([linear_rule(*shape(s), lib) for s in a.linear] + [gemm_rule(*shape(s), lib) for s in a.gemm]
+             + [attention_rule(*shape(s), lib) for s in a.attention])
     if not rules:
-        p.error("give at least one --linear or --gemm")
+        p.error("give at least one --linear, --gemm or --attention")
     a.out.write_text(spec(rules))
 
 

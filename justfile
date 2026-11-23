@@ -256,10 +256,18 @@ metal_iree_cmake_flags := "-DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SU
 mlx_commit := "c23a35c9e6f4b26a2b851dda8c9e0630d13069ad"
 mlx_src := root / "third_party" / "mlx"
 mlx_kernels_out := bioclip_out / "kernels"
-# The BioCLIP 2 matmuls: linears (MxNxK; QKV/out projections, MLP up and
-# down) read their weights untransposed, then the attention batch_matmuls
-# (BxMxNxK; scores, attention x V).
-bioclip_gemms := "--linear 257x1024x1024 --linear 257x4096x1024 --linear 257x1024x4096 --gemm 16x257x257x64 --gemm 16x257x64x257"
+mlx_lib := mlx_kernels_out / "mlx_kernels.metallib"
+# Metal GPU architecture MLX tiles are picked for, e.g. applegpu_g17p for a
+# cross-compile; empty picks them for this machine's GPU, as MLX does.
+metal_gpu_arch := ""
+mlx_arch_flag := if metal_gpu_arch == "" { "" } else { "--arch " + metal_gpu_arch }
+# MLX rules for the BioCLIP 2 encoder. Linears (MxNxK: QKV/out projections,
+# MLP up and down) read their weights untransposed. The SDPA export's
+# attention (BxLxHxD) goes to MLX steel attention as a whole; the decomposed
+# export's attention matmuls (BxMxNxK: scores, attention x V) go to GEMMs.
+bioclip_linears := "--linear 257x1024x1024 --linear 257x4096x1024 --linear 257x1024x4096"
+bioclip_mlx_rules := bioclip_linears + " --attention 1x257x16x64"
+bioclip_mlx_gemm_rules := bioclip_linears + " --gemm 16x257x257x64 --gemm 16x257x64x257"
 
 # Builds LLVM and MLIR from source: about 30 minutes on an M2 Pro. 4 jobs keep
 # peak memory near 6 GB. A rebuild after a patch change takes a few minutes.
@@ -276,29 +284,40 @@ _mlx-clone:
     @{{ if path_exists(mlx_src / ".git") == "true" { "git -C " + quote(mlx_src) + " rev-parse --short HEAD" } else { "git init -q " + quote(mlx_src) + " && git -C " + quote(mlx_src) + " fetch -q --depth 1 https://github.com/ml-explore/mlx " + mlx_commit + " && git -C " + quote(mlx_src) + " checkout -q FETCH_HEAD" } }}
     test "$(git -C {{ quote(mlx_src) }} rev-parse HEAD)" = "{{ mlx_commit }}"
 
-[doc("Compile the MLX steel GEMM wrapper (kernels/mlx_gemm.metal) into a metallib")]
+[doc("Compile the MLX steel GEMM and attention wrappers (kernels/) into one metallib")]
 [macos]
 mlx-kernels: _mlx-clone
-    mkdir -p {{ quote(mlx_kernels_out) }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "kernels" / "gen_mlx_attention.py") }} {{ quote(mlx_src) }} {{ quote(mlx_kernels_out / "gen") }}
     xcrun -sdk macosx metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -c {{ quote(metal_compiler / "kernels" / "mlx_gemm.metal") }} -o {{ quote(mlx_kernels_out / "mlx_gemm.air") }}
-    xcrun -sdk macosx metallib {{ quote(mlx_kernels_out / "mlx_gemm.air") }} -o {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }}
+    xcrun -sdk macosx metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -I {{ quote(mlx_kernels_out / "gen") }} -c {{ quote(metal_compiler / "kernels" / "mlx_attention.metal") }} -o {{ quote(mlx_kernels_out / "mlx_attention.air") }}
+    xcrun -sdk macosx metallib {{ quote(mlx_kernels_out / "mlx_gemm.air") }} {{ quote(mlx_kernels_out / "mlx_attention.air") }} -o {{ quote(mlx_lib) }}
 
-[doc("Check the MLX GEMM kernels against NumPy and IREE's own matmul on the BioCLIP 2 shapes")]
+[doc("Check the MLX GEMM and attention kernels against NumPy and IREE's own codegen on the BioCLIP 2 shapes")]
 [macos]
-mlx-gemm-test: mlx-kernels
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "test_mlx_gemm.py") }} {{ quote(metal_iree_compile) }} {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }} {{ quote(mlx_kernels_out / "test") }}
+mlx-kernel-test: mlx-kernels
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "test_mlx_kernels.py") }} {{ quote(metal_iree_compile) }} {{ quote(mlx_lib) }} {{ quote(mlx_kernels_out / "test") }} {{ mlx_arch_flag }}
 
-# Every batch_matmul in the decomposed export goes to MLX; the rest stays on
-# IREE's metal-spirv codegen. Needs `just metal-iree-compiler` first.
-[doc("Compile the decomposed BioCLIP 2 encoder with MLX GEMMs on Metal and compare it against the fp32 reference")]
-[macos]
-bioclip-metal-mlx: mlx-kernels
-    {{ quote(metal_bin / "iree-compile" + esp_exe) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlirbc") }} --iree-hal-target-device=metal --compile-to=input --emit-mlir-bytecode -o {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }}
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }} {{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }} {{ bioclip_gemms }}
-    {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }} -o {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlx.metal.vmfb") }}
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlx.metal.vmfb") }}
+# Lowers an export to the input phase with the pip compiler, then compiles it
+# with the patched one and the MLX rules; the rest stays on IREE's
+# metal-spirv codegen.
+_bioclip-mlx stem rules: mlx-kernels
+    {{ quote(metal_bin / "iree-compile" + esp_exe) }} {{ quote(bioclip_out / stem + ".mlirbc") }} --iree-hal-target-device=metal --compile-to=input --emit-mlir-bytecode -o {{ quote(bioclip_out / stem + ".input.mlirbc") }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(mlx_lib) }} {{ quote(bioclip_out / stem + ".mlx.spec.mlir") }} {{ rules }} {{ mlx_arch_flag }}
+    {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / stem + ".input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(bioclip_out / stem + ".mlx.spec.mlir") }} -o {{ quote(bioclip_out / stem + ".mlx.metal.vmfb") }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out / stem + ".mlx.metal.vmfb") }}
 
-[doc("Per-dispatch GPU time breakdown of the BioCLIP 2 encoder with MLX GEMMs (after bioclip-metal-mlx)")]
+_bioclip-mlx-profile stem:
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "dispatch_profile.py") }} {{ quote(bioclip_out / stem + ".input.mlirbc") }} {{ quote(bioclip_out / "profile." + stem) }} --compiler {{ quote(metal_iree_compile) }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(bioclip_out / stem + ".mlx.spec.mlir") }}
+
+# Needs `just metal-iree-compiler` first.
+[doc("Compile the BioCLIP 2 encoder with MLX linears and attention on Metal and compare it against the fp32 reference")]
 [macos]
-bioclip-metal-mlx-profile:
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "dispatch_profile.py") }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }} {{ quote(bioclip_out / "profile.mlx") }} --compiler {{ quote(metal_iree_compile) }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }}
+bioclip-metal-mlx: (_bioclip-mlx "vision.b1.r224.f16" bioclip_mlx_rules)
+
+[doc("Same with the decomposed export: attention as MLX GEMMs, softmax on IREE codegen")]
+[macos]
+bioclip-metal-mlx-gemm: (_bioclip-mlx "vision.b1.r224.f16.decomposed" bioclip_mlx_gemm_rules)
+
+[doc("Per-dispatch GPU time breakdown of the MLX build (after bioclip-metal-mlx)")]
+[macos]
+bioclip-metal-mlx-profile: (_bioclip-mlx-profile "vision.b1.r224.f16")
