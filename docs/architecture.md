@@ -5,7 +5,9 @@
 Python. The [ESP32-P4 firmware](../backends/esp32p4/apps/) links the IREE C runtime
 directly and consumes the compiler's VMFB and static dispatch library.
 The host builds provide local CPU drivers and enable the upstream Metal driver
-on macOS. The [root justfile](../justfile) drives both build paths.
+on macOS. The [Metal compiler tooling](../compiler/targets/metal/) routes GEMMs
+and attention to MLX kernels through `hal.dispatch.extern`; see the [BioCLIP 2
+Metal record](benchmarks/metal_bioclip2.md). The [root justfile](../justfile) drives both build paths.
 
 ## Compilation and execution stages
 
