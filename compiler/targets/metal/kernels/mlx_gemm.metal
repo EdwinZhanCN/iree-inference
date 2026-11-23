@@ -170,3 +170,5 @@ template <
 // MLX's choice for medium devices (M1/M2/M3 Pro and Max: applegpu_g1Xs).
 instantiate_gemm_alignments(nn, false, false, 64, 64, 16, 2, 2)
 instantiate_gemm_alignments(nt, false, true, 64, 64, 16, 2, 2)
+// MLX's nt choice for small devices (M1/M2/M3 base: applegpu_g1Xg).
+instantiate_gemm_alignments(nt, false, true, 64, 32, 32, 2, 2)

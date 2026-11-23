@@ -10,7 +10,10 @@ fused by IREE.
 
 External Metal variants need the patched MetalSPIRV target.
 
-  mlx_kernels.py <mlx_gemm.metallib> <spec.mlir> --gemm BxMxNxK [--gemm ...]
+A --linear rule also takes in the transpose and batch-1 broadcast of a
+torch linear's weight and uses the nt kernel on the original weight.
+
+  mlx_kernels.py <mlx_gemm.metallib> <spec.mlir> [--linear MxNxK]... [--gemm BxMxNxK]...
 """
 import argparse
 from pathlib import Path
@@ -25,15 +28,21 @@ METAL_TARGET = (
     "max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 32768, "
     "max_workgroup_counts = [65535, 65535, 65535]>>}>"
 )
-# MLX's tile choice for medium Apple GPUs (M1/M2/M3 Pro and Max).
-BM, BN, BK, WM, WN, SWIZZLE = 64, 64, 16, 2, 2, 2
+# (BM, BN, BK, WM, WN) per layout; must be instantiated in mlx_gemm.metal.
+# MLX uses 64x64x16 for every layout on medium Apple GPUs (M1/M2/M3 Pro and
+# Max) and 64x32x32 for nt on small ones. On an M2 Pro 64x32x32 is faster for
+# the BioCLIP 2 nt shapes (257x1024x4096: 0.97 vs 1.36 ms per call).
+TILES = {"nn": (64, 64, 16, 2, 2), "nt": (64, 32, 32, 2, 2)}
+SWIZZLE = 2
 ALIGNMENTS = {"aaa", "uaa", "aua", "uua"}  # instantiated, plus "uuu"
 
 
 def kernel_name(m, n, k, nt=False):
-    align = "".join("a" if d % t == 0 else "u" for d, t in ((m, BM), (n, BN), (k, BK)))
+    layout = "nt" if nt else "nn"
+    bm, bn, bk, wm, wn = TILES[layout]
+    align = "".join("a" if d % t == 0 else "u" for d, t in ((m, bm), (n, bn), (k, bk)))
     align = align if align in ALIGNMENTS else "uuu"
-    return f"mlx_gemm_{'nt' if nt else 'nn'}_f16_bm{BM}_bn{BN}_bk{BK}_wm{WM}_wn{WN}_{align}"
+    return f"mlx_gemm_{layout}_f16_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_{align}"
 
 
 def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=None, indent="    "):
@@ -43,7 +52,8 @@ def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=No
     a_type = a_type or f"tensor<{prefix}{m}x{k}xf16>"
     b_type = b_type or (f"tensor<{prefix}{n}x{k}xf16>" if nt else f"tensor<{prefix}{k}x{n}xf16>")
     d_type = f"tensor<{prefix}{m}x{n}xf16>"
-    tiles_m, tiles_n = -(-m // BM), -(-n // BN)
+    bm, bn, _, wm, wn = TILES["nt" if nt else "nn"]
+    tiles_m, tiles_n = -(-m // bm), -(-n // bn)
     grid = (tiles_n << SWIZZLE, -(-tiles_m // (1 << SWIZZLE)), batch or 1)
     consts = [m, n, k, k, k if nt else n, n, m * k, n * k, m * n]
     lines = [f"%c{i} = arith.constant {v} : i32" for i, v in enumerate(consts)]
@@ -66,60 +76,97 @@ def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=No
         "  objects({",
         f'    #metal_target ordinal(0) = [#hal.executable.object<{{path = "{metallib}"}}>]',
         "  })",
-        f"  <{{workgroup_size = [32 : index, {WN} : index, {WM} : index]}}>",
+        f"  <{{workgroup_size = [32 : index, {wn} : index, {wm} : index]}}>",
     ]
     return [indent + line for line in lines], d_type
 
 
-def spec(gemms, metallib):
-    helpers, matchers, rules = [], [], []
-    for batch, m, n, k in gemms:
-        tag = f"{batch}x{m}x{n}x{k}"
-        a, b = f"tensor<{batch}x{m}x{k}xf16>", f"tensor<{batch}x{k}x{n}xf16>"
-        acc = f"tensor<{batch}x{m}x{n}xf32>"
-        body, d_type = gemm_extern("%a", "%b", batch, m, n, k, metallib)
-        helpers.append("\n".join([
-            f"  util.func private @mlx_gemm_{tag}(%a: {a}, %b: {b}, %init: {acc}) -> {acc} {{",
-            *body,
-            f"    %r = arith.extf %d : {d_type} to {acc}",
-            f"    util.return %r : {acc}",
-            "  }",
-        ]))
-        matchers.append(f"""\
-  transform.named_sequence @match_{tag}(%root: !transform.any_op {{transform.readonly}})
+def rule(name, args, dag, body, acc):
+    """A matcher for the DAG over `args` (rooted at its last op) and an action
+    that replaces the root with a call to a helper computing `body` from the
+    same args. Returns (helper, named sequences, foreach_match rule)."""
+    params = ", ".join(f"%{n}: {t}" for n, t in args)
+    helper = "\n".join([
+        f"  util.func private @{name}({params}) -> {acc} {{",
+        *body,
+        f"    util.return %r : {acc}",
+        "  }",
+    ])
+    dag = "\n".join(f"        {line}" for line in dag)
+    sequences = f"""\
+  transform.named_sequence @match_{name}(%root: !transform.any_op {{transform.readonly}})
       -> (!transform.any_value, !transform.any_value) {{
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {{
-      ^bb0(%a: {a}, %b: {b}, %init: {acc}):
-        %zero = arith.constant 0.0 : f32
-        %fill = linalg.fill ins(%zero : f32) outs(%init : {acc}) -> {acc}
-        %mm = linalg.batch_matmul ins(%a, %b : {a}, {b}) outs(%fill : {acc}) -> {acc}
+      ^bb0({params}):
+{dag}
     }} : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }}
-  transform.named_sequence @call_{tag}(%ins: !transform.any_value {{transform.readonly}},
-                                       %out: !transform.any_value {{transform.readonly}}) {{
+  transform.named_sequence @call_{name}(%ins: !transform.any_value {{transform.readonly}},
+                                        %out: !transform.any_value {{transform.readonly}}) {{
     %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
     %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
-    %func = transform.util.import_symbol @mlx_gemm_{tag} into %module if undefined
+    %func = transform.util.import_symbol @{name} into %module if undefined
         : (!transform.any_op) -> !transform.any_op
     transform.util.cast_and_call %func(%ins) -> %out after %root {{
     }} : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
     transform.yield
-  }}""")
-        rules.append(f"@match_{tag} -> @call_{tag}")
+  }}"""
+    return helper, sequences, f"@match_{name} -> @call_{name}"
+
+
+def gemm_rule(batch, m, n, k, metallib):
+    """fill(0) + batch_matmul(A[b,m,k], B[b,k,n])."""
+    a, b = f"tensor<{batch}x{m}x{k}xf16>", f"tensor<{batch}x{k}x{n}xf16>"
+    acc = f"tensor<{batch}x{m}x{n}xf32>"
+    body, d_type = gemm_extern("%a", "%b", batch, m, n, k, metallib)
+    return rule(f"mlx_gemm_{batch}x{m}x{n}x{k}", [("a", a), ("b", b), ("init", acc)], [
+        "%zero = arith.constant 0.0 : f32",
+        f"%fill = linalg.fill ins(%zero : f32) outs(%init : {acc}) -> {acc}",
+        f"%mm = linalg.batch_matmul ins(%a, %b : {a}, {b}) outs(%fill : {acc}) -> {acc}",
+    ], body + [f"    %r = arith.extf %d : {d_type} to {acc}"], acc)
+
+
+def linear_rule(m, n, k, metallib):
+    """A torch linear without bias as it reaches preprocessing: the weight
+    W[n,k] is transposed, broadcast to batch 1, then fill(0) + batch_matmul.
+    The nt kernel reads W directly, so no transposed copy of the weight is
+    made (IREE folds that copy at compile time, but not when the consumer is
+    an extern dispatch)."""
+    a, w = f"tensor<1x{m}x{k}xf16>", f"tensor<{n}x{k}xf16>"
+    wt, wb = f"tensor<{k}x{n}xf16>", f"tensor<1x{k}x{n}xf16>"
+    acc = f"tensor<1x{m}x{n}xf32>"
+    body, d_type = gemm_extern("%a", "%w", 1, m, n, k, metallib, nt=True, b_type=w)
+    return rule(f"mlx_linear_{m}x{n}x{k}",
+                [("a", a), ("w", w), ("wt_init", wt), ("wb_init", wb), ("init", acc)], [
+        f"%wt = linalg.transpose ins(%w : {w}) outs(%wt_init : {wt}) permutation = [1, 0]",
+        "%wb = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d1, d2)>, "
+        "affine_map<(d0, d1, d2) -> (d0, d1, d2)>], iterator_types = [\"parallel\", \"parallel\", \"parallel\"]}"
+        f" ins(%wt : {wt}) outs(%wb_init : {wb}) {{",
+        "^bb0(%in: f16, %out: f16):",
+        "  linalg.yield %in : f16",
+        f"}} -> {wb}",
+        "%zero = arith.constant 0.0 : f32",
+        f"%fill = linalg.fill ins(%zero : f32) outs(%init : {acc}) -> {acc}",
+        f"%mm = linalg.batch_matmul ins(%a, %wb : {a}, {wb}) outs(%fill : {acc}) -> {acc}",
+    ], body + [f"    %r = arith.extf %d : {d_type} to {acc}"], acc)
+
+
+def spec(rules):
+    helpers, sequences, matches = zip(*rules)
     return f"""// Generated by compiler/targets/metal/mlx_kernels.py.
 #metal_target = {METAL_TARGET}
 module attributes {{transform.with_named_sequence}} {{
 {chr(10).join(helpers)}
 
-{chr(10).join(matchers)}
+{chr(10).join(sequences)}
 
   transform.named_sequence @__transform_main(%module: !transform.any_op) {{
     %funcs = transform.structured.match ops{{["util.func"]}} in %module : (!transform.any_op) -> !transform.any_op
     transform.foreach %funcs : !transform.any_op {{
       ^bb1(%func: !transform.any_op):
         transform.foreach_match in %func
-            {(chr(10) + "            , ").join(rules)}
+            {(chr(10) + "            , ").join(matches)}
           : (!transform.any_op) -> (!transform.any_op)
     }}
     transform.apply_dce to %module : !transform.any_op
@@ -134,10 +181,16 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("metallib", type=Path)
     p.add_argument("out", type=Path)
-    p.add_argument("--gemm", action="append", required=True, help="BxMxNxK of a batch_matmul to replace")
+    p.add_argument("--linear", action="append", default=[],
+                   help="MxNxK of a bias-free torch linear (transposed weight) to replace; tried first")
+    p.add_argument("--gemm", action="append", default=[], help="BxMxNxK of a batch_matmul to replace")
     a = p.parse_args()
-    gemms = [tuple(int(x) for x in g.split("x")) for g in a.gemm]
-    a.out.write_text(spec(gemms, a.metallib.resolve()))
+    lib = a.metallib.resolve()
+    shape = lambda s: tuple(int(x) for x in s.split("x"))
+    rules = [linear_rule(*shape(s), lib) for s in a.linear] + [gemm_rule(*shape(s), lib) for s in a.gemm]
+    if not rules:
+        p.error("give at least one --linear or --gemm")
+    a.out.write_text(spec(rules))
 
 
 if __name__ == "__main__":

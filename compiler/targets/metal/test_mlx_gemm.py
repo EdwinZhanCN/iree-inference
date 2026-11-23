@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+import mlx_kernels
 from mlx_kernels import METAL_TARGET, gemm_extern, kernel_name
 
 BIN = Path(sys.executable).parent
@@ -77,7 +78,10 @@ def main():
     p.add_argument("work_dir", type=Path)
     p.add_argument("--shape", action="append",
                    help="MxNxK, with :nt for a transposed B (default: the BioCLIP 2 shapes and one unaligned shape)")
+    p.add_argument("--nt-tile", help="BMxBNxBKxWMxWN for nt kernels (default: mlx_kernels.TILES)")
     a = p.parse_args()
+    if a.nt_tile:
+        mlx_kernels.TILES["nt"] = tuple(int(x) for x in a.nt_tile.split("x"))
     # The model's weights reach the dispatch as KxN, so nn.
     a.shape = a.shape or ["257x1024x1024", "257x4096x1024", "257x1024x4096", "100x96x40", "257x1024x1024:nt"]
     a.work_dir.mkdir(parents=True, exist_ok=True)

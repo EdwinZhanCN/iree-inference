@@ -256,9 +256,10 @@ metal_iree_cmake_flags := "-DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SU
 mlx_commit := "c23a35c9e6f4b26a2b851dda8c9e0630d13069ad"
 mlx_src := root / "third_party" / "mlx"
 mlx_kernels_out := bioclip_out / "kernels"
-# BxMxNxK of the BioCLIP 2 batch_matmuls: QKV/out projections, MLP up and
-# down, then attention scores and attention x V.
-bioclip_gemms := "--gemm 1x257x1024x1024 --gemm 1x257x4096x1024 --gemm 1x257x1024x4096 --gemm 16x257x257x64 --gemm 16x257x64x257"
+# The BioCLIP 2 matmuls: linears (MxNxK; QKV/out projections, MLP up and
+# down) read their weights untransposed, then the attention batch_matmuls
+# (BxMxNxK; scores, attention x V).
+bioclip_gemms := "--linear 257x1024x1024 --linear 257x4096x1024 --linear 257x1024x4096 --gemm 16x257x257x64 --gemm 16x257x64x257"
 
 # Builds LLVM and MLIR from source: about 30 minutes on an M2 Pro. 4 jobs keep
 # peak memory near 6 GB. A rebuild after a patch change takes a few minutes.
