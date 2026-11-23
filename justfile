@@ -297,3 +297,8 @@ bioclip-metal-mlx: mlx-kernels
     {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }} {{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }} {{ bioclip_gemms }}
     {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }} -o {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlx.metal.vmfb") }}
     {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlx.metal.vmfb") }}
+
+[doc("Per-dispatch GPU time breakdown of the BioCLIP 2 encoder with MLX GEMMs (after bioclip-metal-mlx)")]
+[macos]
+bioclip-metal-mlx-profile:
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "dispatch_profile.py") }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }} {{ quote(bioclip_out / "profile.mlx") }} --compiler {{ quote(metal_iree_compile) }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }}

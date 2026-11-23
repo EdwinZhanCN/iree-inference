@@ -4,9 +4,15 @@ IREE's Metal HAL has no device profiling (--device_profiling_mode returns
 UNIMPLEMENTED), so this times each executable on its own and weights it by how
 often the model dispatches it:
 
-  1. lower the input to stream IR and count stream.cmd.dispatch sites;
-  2. dump one standalone benchmark module per executable;
+  1. lower the input to stream IR and count stream.cmd.dispatch sites per
+     (executable, export, workload);
+  2. dump standalone benchmark modules: one per executable, with one function
+     per distinct workload;
   3. compile and run each with iree-benchmark-module, one at a time.
+
+External dispatches (hal.dispatch.extern) of different shapes can share one
+executable; they are told apart by their workload, which mlx_kernels.py sets
+to the problem size.
 
 The dumped modules keep translation_info but lose lowering_config, which
 makes matmuls fail to compile; translation_info is stripped so configuration
@@ -28,35 +34,51 @@ COMPILER = BIN / "iree-compile"
 TRANSLATION_INFO = re.compile(r" attributes \{translation_info = #iree_codegen\.translation_info<[^}]*>\}")
 # FLOPs for matmul-like executables, from the shape in the executable name.
 MATMUL = re.compile(r"(batch_)?matmul_(?:(\d+)x)?(\d+)x(\d+)x(\d+)_")
+# @exe::@export for generated executables, @exe::@variant::@export for
+# external ones; then the workload when there is one. The printer names index
+# constants %c<value> (%c<value>_<n> when repeated).
+SITE = re.compile(r"stream\.cmd\.dispatch @([^:\s]+)::(?:@[^:\s]+::)?@([^\s(\[]+)(?:\[([^\]]*)\])?")
 
 
 def run(*cmd, **kw):
     return subprocess.run([str(c) for c in cmd], check=True, text=True, capture_output=True, **kw).stdout
 
 
+def workload(text):
+    if not text:
+        return ""
+    values = [re.fullmatch(r"%c(\d+)(?:_\d+)?", v.strip()) for v in text.split(",")]
+    return "x".join(v.group(1) for v in values) if all(values) else ""
+
+
 def dispatch_counts(src, work, flags):
     stream = work / "stream.mlir"
-    run(COMPILER, src, *flags, "--compile-to=stream", "-o", stream)
-    # @exe::@export for generated executables, @exe::@variant::@export for
-    # external ones. Initializers run once at load and are not counted.
-    sites = re.findall(r"stream\.cmd\.dispatch @([^:\s]+)::(?:@[^:\s]+::)?@([^\s(]+)", stream.read_text())
-    return collections.Counter((exe, export) for exe, export in sites if not exe.startswith("_initializer"))
+    run(COMPILER, src, *flags, "--compile-to=stream", "--mlir-elide-resource-strings-if-larger=16", "-o", stream)
+    # Initializers run once at load and are not counted.
+    return collections.Counter((exe, export, workload(wl)) for exe, export, wl in SITE.findall(stream.read_text())
+                               if not exe.startswith("_initializer"))
 
 
-def bench_one(mlir, work, batch):
-    name = re.match(r"module_(.+)_metal_msl_fb_benchmark\.mlir", mlir.name).group(1)
-    fixed = work / f"{name}.mlir".replace("$", "_")
+def bench_file(mlir, work, batch):
+    """Returns {benchmark function name: us per dispatch}."""
+    fixed = work / mlir.name.replace("$", "_")
     fixed.write_text(TRANSLATION_INFO.sub("", mlir.read_text()))
     vmfb = fixed.with_suffix(".vmfb")
     run(COMPILER, fixed, "-o", vmfb)
-    # iree-benchmark-module reports time per batch item.
+    # iree-benchmark-module runs every benchmark function and reports time
+    # per batch item.
     out = run(BIN / "iree-benchmark-module", "--device=metal", f"--module={vmfb}", f"--batch_size={batch}",
               "--benchmark_repetitions=5", "--benchmark_min_time=0.3s", "--benchmark_report_aggregates_only=true")
-    value, unit = re.search(r"real_time_median\s+([\d.]+) (\w+)", out).groups()
-    return name, float(value) * {"ns": 1e-3, "us": 1, "ms": 1e3}[unit]
+    times = {}
+    for name, value, unit in re.findall(r"BM_(\S+?)/\S*real_time_median\s+([\d.]+) (\w+)", out):
+        times[name] = float(value) * {"ns": 1e-3, "us": 1, "ms": 1e3}[unit]
+    return times
 
 
-def flops(kind):
+def flops(kind, wl):
+    if kind.startswith("mlx_gemm") and wl.count("x") == 3:
+        b, m, n, k = (int(x) for x in wl.split("x"))
+        return 2 * b * m * n * k
     m = MATMUL.search(kind + "_")
     if not m:
         return None
@@ -85,21 +107,26 @@ def main():
     for mlir in sorted(dumps.glob("*.mlir")):
         if mlir.name.startswith("module__initializer"):
             continue
-        name, us = bench_one(mlir, a.work_dir, a.batch)
-        times[name] = us
-        print(f"  {name} {us:.1f} us", file=sys.stderr)
+        for name, us in bench_file(mlir, a.work_dir, a.batch).items():
+            times[name] = us
+            print(f"  {name} {us:.1f} us", file=sys.stderr)
 
     rows = []
-    for (exe, export), n in counts.items():
+    for (exe, export, wl), n in counts.items():
+        base = f"{exe}_metal_msl_fb_{export}"
+        us = times.get(f"{base}_{wl}", times.get(base))
+        if us is None:
+            sys.exit(f"no benchmark for {base} (workload {wl or 'none'})")
         m = re.match(r"main\$async_(dispatch_\d+)_(\w+)", export)
         d, kind = m.groups() if m else (exe, export)
-        rows.append((n * times[exe], n, times[exe], d, kind))
+        rows.append((n * us, n, us, d, kind, wl))
     total = sum(r[0] for r in rows)
-    print(f"{'dispatch':17s} {'kind':45s} {'calls':>5s} {'each':>9s} {'total':>9s} {'share':>6s}  rate")
-    for t, n, us, d, kind in sorted(rows, reverse=True):
-        f = flops(kind)
+    print(f"{'dispatch':17s} {'kind':60s} {'calls':>5s} {'each':>9s} {'total':>9s} {'share':>6s}  rate")
+    for t, n, us, d, kind, wl in sorted(rows, reverse=True):
+        f = flops(kind, wl)
         rate = f"{f / us / 1e6:.2f} TFLOPS" if f else ""
-        print(f"{d:17s} {kind:45s} {n:5d} {us / 1e3:6.2f} ms {t / 1e3:6.1f} ms {100 * t / total:5.1f}%  {rate}")
+        label = f"{kind} {wl}" if kind.startswith("mlx_") else kind
+        print(f"{d:17s} {label:60s} {n:5d} {us / 1e3:6.2f} ms {t / 1e3:6.1f} ms {100 * t / total:5.1f}%  {rate}")
     print(f"total {total / 1e3:.1f} ms over {sum(counts.values())} dispatches")
 
 

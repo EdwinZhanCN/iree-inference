@@ -29,10 +29,12 @@ METAL_TARGET = (
     "max_workgroup_counts = [65535, 65535, 65535]>>}>"
 )
 # (BM, BN, BK, WM, WN) per layout; must be instantiated in mlx_gemm.metal.
-# MLX uses 64x64x16 for every layout on medium Apple GPUs (M1/M2/M3 Pro and
-# Max) and 64x32x32 for nt on small ones. On an M2 Pro 64x32x32 is faster for
-# the BioCLIP 2 nt shapes (257x1024x4096: 0.97 vs 1.36 ms per call).
-TILES = {"nn": (64, 64, 16, 2, 2), "nt": (64, 32, 32, 2, 2)}
+# nn is MLX's choice for medium Apple GPUs (M1/M2/M3 Pro and Max). For nt,
+# 32x32x32 was the fastest on an M2 Pro for the BioCLIP 2 linears (M = 257)
+# among MLX's presets (64x64x16, 64x32x32, 32x64x16) and 32x32x16, 32x64x32,
+# 64x64x32: the three linear shapes take 42.0 ms per encoder call against
+# 47.8 ms with 64x32x32 and BM = 32 wastes less of the last tile row.
+TILES = {"nn": (64, 64, 16, 2, 2), "nt": (32, 32, 32, 2, 2)}
 SWIZZLE = 2
 ALIGNMENTS = {"aaa", "uaa", "aua", "uua"}  # instantiated, plus "uuu"
 
@@ -57,12 +59,18 @@ def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=No
     grid = (tiles_n << SWIZZLE, -(-tiles_m // (1 << SWIZZLE)), batch or 1)
     consts = [m, n, k, k, k if nt else n, n, m * k, n * k, m * n]
     lines = [f"%c{i} = arith.constant {v} : i32" for i, v in enumerate(consts)]
+    # The workload is the problem size. The grid does not need it, but IREE
+    # keys per-dispatch benchmarks on it, so each shape is benchmarked on its
+    # own even when shapes share one kernel (and so one executable).
+    workload = [batch or 1, m, n, k]
+    lines += [f"%w{i} = arith.constant {v} : index" for i, v in enumerate(workload)]
     args = ", ".join(f"%c{i}" for i in range(len(consts)))
     types = ", ".join("i32" for _ in consts)
     lines += [
-        f'%d = hal.dispatch.extern "{kernel_name(m, n, k, nt)}"({args}, {a}, {b})',
+        f'%d = hal.dispatch.extern "{kernel_name(m, n, k, nt)}"[%w0, %w1, %w2, %w3]({args}, {a}, {b})',
         f"    : ({types}, {a_type}, {b_type}) -> {d_type}",
-        "  count(%device: !hal.device) -> (index, index, index) {",
+        "  count(%device: !hal.device, %wb: index, %wm: index, %wn: index, %wk: index)"
+        " -> (index, index, index) {",
         f"    %x = arith.constant {grid[0]} : index",
         f"    %y = arith.constant {grid[1]} : index",
         f"    %z = arith.constant {grid[2]} : index",

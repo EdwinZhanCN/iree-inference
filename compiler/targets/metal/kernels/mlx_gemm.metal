@@ -167,8 +167,8 @@ template <
   instantiate_gemm(tname, ta, tb, bm, bn, bk, wm, wn, false, false, true, "uua") \
   instantiate_gemm(tname, ta, tb, bm, bn, bk, wm, wn, false, false, false, "uuu")
 
-// MLX's choice for medium devices (M1/M2/M3 Pro and Max: applegpu_g1Xs).
+// nn: MLX's choice for medium devices (M1/M2/M3 Pro and Max: applegpu_g1Xs).
 instantiate_gemm_alignments(nn, false, false, 64, 64, 16, 2, 2)
-instantiate_gemm_alignments(nt, false, true, 64, 64, 16, 2, 2)
-// MLX's nt choice for small devices (M1/M2/M3 base: applegpu_g1Xg).
-instantiate_gemm_alignments(nt, false, true, 64, 32, 32, 2, 2)
+// nt: fastest on an M2 Pro for the BioCLIP 2 linears (M = 257) among MLX's
+// presets and a few BM = 32 tiles; see mlx_kernels.TILES.
+instantiate_gemm_alignments(nt, false, true, 32, 32, 32, 2, 2)
