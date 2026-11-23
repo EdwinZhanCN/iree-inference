@@ -197,3 +197,48 @@ esp-iree-p4:
 esp-p4-rec: esp-venv esp-plugin esp-iree-p4
     {{ quote(esp_py) }} {{ quote(esp_compiler / "gen_model_io.py") }} {{ quote(esp_plugin) }} {{ quote(esp_out / "rec" / "rec.espdl.host.vmfb") }} rec {{ quote(esp_out / "rec" / "model_io") }}
     idf -C {{ quote(esp_rec_app) }} run
+
+# ---- Metal: BioCLIP 2 image encoder ------------------------------------------
+# Upstream weights (hf-hub:imageomics/bioclip-2, MIT) and outputs live in
+# third_party/bioclip-2/. The TreeOfLife index is Lumen-Hub's; point
+# BIOCLIP_DATASETS at its datasets/ directory. Recipes run one heavy job at a
+# time: the ViT-L conversions peak at ~5 GB each.
+
+metal_venv := root / ".venv-metal"
+metal_bin := metal_venv / if os_family() == "windows" { "Scripts" } else { "bin" }
+metal_py := metal_bin / "python" + esp_exe
+metal_compiler := root / "compiler" / "targets" / "metal"
+bioclip := root / "third_party" / "bioclip-2"
+bioclip_out := bioclip / "out"
+bioclip_datasets := env("BIOCLIP_DATASETS", "/Volumes/CodeBase/Projects/Lumen-Hub/models/bioclip-2/datasets")
+
+metal-venv:
+    @{{ if path_exists(metal_py) == "true" { "" } else { "uv venv --python 3.12 " + quote(metal_venv) } }}
+    uv pip install --quiet --python {{ quote(metal_venv) }} -r {{ quote(metal_compiler / "requirements.txt") }}
+
+[doc("Download BioCLIP 2 (open_clip weights) and the iNaturalist sample photos into third_party/bioclip-2")]
+bioclip-fetch: metal-venv
+    {{ quote(metal_py) }} -c "from huggingface_hub import hf_hub_download as d; [d('imageomics/bioclip-2', f, local_dir='{{ bioclip / "upstream" }}') for f in ('open_clip_config.json', 'open_clip_model.safetensors', 'README.md')]"
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "fetch_samples.py") }} {{ quote(bioclip / "samples") }}
+
+[doc("Export the BioCLIP 2 fp32 reference, the f16 IREE MLIR (SDPA and decomposed) and the Core ML tier-2 package")]
+bioclip-export: bioclip-fetch
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "export.py") }} reference {{ quote(bioclip / "upstream") }} {{ quote(bioclip / "samples") }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out) }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "export.py") }} iree {{ quote(bioclip / "upstream") }} {{ quote(bioclip_out) }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "export.py") }} iree {{ quote(bioclip / "upstream") }} {{ quote(bioclip_out) }} --attention decomposed
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "export.py") }} coreml {{ quote(bioclip / "upstream") }} {{ quote(bioclip_out) }}
+
+# IREE 3.13's metal-spirv cannot compile iree_linalg_ext.attention, so the
+# default-path baseline uses the decomposed export.
+[doc("Compile the decomposed BioCLIP 2 encoder with IREE's default Metal path and compare it against the fp32 reference")]
+[macos]
+bioclip-metal-baseline:
+    {{ quote(metal_bin / "iree-compile" + esp_exe) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlirbc") }} --iree-hal-target-device=metal -o {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.metal.vmfb") }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.metal.vmfb") }}
+
+# Metal HAL has no device profiling, so each executable is benchmarked on its
+# own and weighted by its dispatch count. Takes about 10 minutes.
+[doc("Per-dispatch GPU time breakdown of the decomposed BioCLIP 2 encoder on IREE's default Metal path")]
+[macos]
+bioclip-metal-profile:
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "dispatch_profile.py") }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlirbc") }} {{ quote(bioclip_out / "profile.decomposed") }} --iree-hal-target-device=metal

@@ -1,0 +1,13 @@
+# Metal model tooling (`just metal-venv`). The IREE packages must match the
+# runtime pinned in the justfile / Cargo.toml (vmfb is not ABI-stable).
+torch==2.15.0
+open-clip-torch==4.2.2
+iree-base-compiler==3.13.0
+iree-base-runtime==3.13.0
+iree-turbine==3.9.0
+coremltools==9.0
+onnxruntime==1.32.0
+numpy==2.5.5
+pillow==13.0.0
+safetensors==0.8.0
+huggingface-hub==2.4.0
