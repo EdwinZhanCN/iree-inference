@@ -242,3 +242,57 @@ bioclip-metal-baseline:
 [macos]
 bioclip-metal-profile:
     {{ quote(metal_py) }} {{ quote(metal_compiler / "dispatch_profile.py") }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlirbc") }} {{ quote(bioclip_out / "profile.decomposed") }} --iree-hal-target-device=metal
+
+# ---- Metal: MLX kernels through hal.dispatch.extern --------------------------
+# The pip compiler has no external Metal executables, so iree-compile is built
+# from the pinned IREE source with patches/iree-metal-external-executables.patch
+# (Metal target only, no torch input). Torch modules go through the pip
+# compiler to the input phase first; both are the same commit.
+
+metal_iree_build := root / "third_party" / "iree-build-compiler"
+metal_iree_compile := metal_iree_build / "tools" / "iree-compile"
+metal_iree_patch := metal_compiler / "patches" / "iree-metal-external-executables.patch"
+metal_iree_cmake_flags := "-DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_BUILD_COMPILER=ON -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_BUILD_PYTHON_BINDINGS=OFF -DIREE_BUILD_BUNDLED_LLVM=ON -DIREE_INPUT_TORCH=OFF -DIREE_INPUT_STABLEHLO=OFF -DIREE_INPUT_TOSA=OFF -DIREE_TARGET_BACKEND_DEFAULTS=OFF -DIREE_TARGET_BACKEND_METAL_SPIRV=ON -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_LOCAL_SYNC=ON -DIREE_ENABLE_ASSERTIONS=OFF -DLLVM_PARALLEL_LINK_JOBS=1"
+mlx_commit := "c23a35c9e6f4b26a2b851dda8c9e0630d13069ad"
+mlx_src := root / "third_party" / "mlx"
+mlx_kernels_out := bioclip_out / "kernels"
+# BxMxNxK of the BioCLIP 2 batch_matmuls: QKV/out projections, MLP up and
+# down, then attention scores and attention x V.
+bioclip_gemms := "--gemm 1x257x1024x1024 --gemm 1x257x4096x1024 --gemm 1x257x1024x4096 --gemm 16x257x257x64 --gemm 16x257x64x257"
+
+# Builds LLVM and MLIR from source: about 30 minutes on an M2 Pro. 4 jobs keep
+# peak memory near 6 GB. A rebuild after a patch change takes a few minutes.
+[doc("Build iree-compile with the Metal external-executable patch into third_party/iree-build-compiler")]
+[macos]
+metal-iree-compiler: _iree-clone
+    test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
+    git -C {{ quote(iree_src) }} submodule update --init --depth 1 third_party/llvm-project {{ iree_submodules }}
+    git -C {{ quote(iree_src) }} apply --reverse --check {{ quote(metal_iree_patch) }} || git -C {{ quote(iree_src) }} apply {{ quote(metal_iree_patch) }}
+    cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(metal_iree_build) }} {{ metal_iree_cmake_flags }}
+    ninja -C {{ quote(metal_iree_build) }} -j4 iree-compile
+
+_mlx-clone:
+    @{{ if path_exists(mlx_src / ".git") == "true" { "git -C " + quote(mlx_src) + " rev-parse --short HEAD" } else { "git init -q " + quote(mlx_src) + " && git -C " + quote(mlx_src) + " fetch -q --depth 1 https://github.com/ml-explore/mlx " + mlx_commit + " && git -C " + quote(mlx_src) + " checkout -q FETCH_HEAD" } }}
+    test "$(git -C {{ quote(mlx_src) }} rev-parse HEAD)" = "{{ mlx_commit }}"
+
+[doc("Compile the MLX steel GEMM wrapper (kernels/mlx_gemm.metal) into a metallib")]
+[macos]
+mlx-kernels: _mlx-clone
+    mkdir -p {{ quote(mlx_kernels_out) }}
+    xcrun -sdk macosx metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -c {{ quote(metal_compiler / "kernels" / "mlx_gemm.metal") }} -o {{ quote(mlx_kernels_out / "mlx_gemm.air") }}
+    xcrun -sdk macosx metallib {{ quote(mlx_kernels_out / "mlx_gemm.air") }} -o {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }}
+
+[doc("Check the MLX GEMM kernels against NumPy and IREE's own matmul on the BioCLIP 2 shapes")]
+[macos]
+mlx-gemm-test: mlx-kernels
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "test_mlx_gemm.py") }} {{ quote(metal_iree_compile) }} {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }} {{ quote(mlx_kernels_out / "test") }}
+
+# Every batch_matmul in the decomposed export goes to MLX; the rest stays on
+# IREE's metal-spirv codegen. Needs `just metal-iree-compiler` first.
+[doc("Compile the decomposed BioCLIP 2 encoder with MLX GEMMs on Metal and compare it against the fp32 reference")]
+[macos]
+bioclip-metal-mlx: mlx-kernels
+    {{ quote(metal_bin / "iree-compile" + esp_exe) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlirbc") }} --iree-hal-target-device=metal --compile-to=input --emit-mlir-bytecode -o {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(mlx_kernels_out / "mlx_gemm.metallib") }} {{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }} {{ bioclip_gemms }}
+    {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-preprocessing-transform-spec-filename={{ quote(mlx_kernels_out / "mlx_gemm.spec.mlir") }} -o {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlx.metal.vmfb") }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlx.metal.vmfb") }}

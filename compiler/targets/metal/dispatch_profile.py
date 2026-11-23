@@ -13,7 +13,7 @@ makes matmuls fail to compile; translation_info is stripped so configuration
 runs again with the same heuristics as the full compile. The weighted sum
 should land close to the end-to-end call time.
 
-  dispatch_profile.py <input.mlirbc> <work_dir> [iree-compile flags...]
+  dispatch_profile.py <input.mlirbc> <work_dir> [--compiler PATH] [iree-compile flags...]
 """
 import argparse
 import collections
@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 BIN = Path(sys.executable).parent
+COMPILER = BIN / "iree-compile"
 TRANSLATION_INFO = re.compile(r" attributes \{translation_info = #iree_codegen\.translation_info<[^}]*>\}")
 # FLOPs for matmul-like executables, from the shape in the executable name.
 MATMUL = re.compile(r"(batch_)?matmul_(?:(\d+)x)?(\d+)x(\d+)x(\d+)_")
@@ -35,17 +36,19 @@ def run(*cmd, **kw):
 
 def dispatch_counts(src, work, flags):
     stream = work / "stream.mlir"
-    run(BIN / "iree-compile", src, *flags, "--compile-to=stream", "-o", stream)
-    sites = re.findall(r"stream\.cmd\.dispatch @[^:]+::@(\S+?)[\s(]", stream.read_text())
-    return collections.Counter(sites)
+    run(COMPILER, src, *flags, "--compile-to=stream", "-o", stream)
+    # @exe::@export for generated executables, @exe::@variant::@export for
+    # external ones. Initializers run once at load and are not counted.
+    sites = re.findall(r"stream\.cmd\.dispatch @([^:\s]+)::(?:@[^:\s]+::)?@([^\s(]+)", stream.read_text())
+    return collections.Counter((exe, export) for exe, export in sites if not exe.startswith("_initializer"))
 
 
 def bench_one(mlir, work, batch):
-    name = re.search(r"async_(dispatch_\d+)_", mlir.name).group(1)
-    fixed = work / f"{name}.mlir"
+    name = re.match(r"module_(.+)_metal_msl_fb_benchmark\.mlir", mlir.name).group(1)
+    fixed = work / f"{name}.mlir".replace("$", "_")
     fixed.write_text(TRANSLATION_INFO.sub("", mlir.read_text()))
-    vmfb = work / f"{name}.vmfb"
-    run(BIN / "iree-compile", fixed, "-o", vmfb)
+    vmfb = fixed.with_suffix(".vmfb")
+    run(COMPILER, fixed, "-o", vmfb)
     # iree-benchmark-module reports time per batch item.
     out = run(BIN / "iree-benchmark-module", "--device=metal", f"--module={vmfb}", f"--batch_size={batch}",
               "--benchmark_repetitions=5", "--benchmark_min_time=0.3s", "--benchmark_report_aggregates_only=true")
@@ -66,32 +69,37 @@ def main():
     p.add_argument("input", type=Path)
     p.add_argument("work_dir", type=Path)
     p.add_argument("--batch", type=int, default=100, help="dispatches per command buffer")
+    p.add_argument("--compiler", type=Path, default=COMPILER, help="iree-compile to use")
     a, flags = p.parse_known_args()
+    globals()["COMPILER"] = a.compiler
     flags = flags or ["--iree-hal-target-device=metal"]
 
     shutil.rmtree(a.work_dir, ignore_errors=True)
     dumps = a.work_dir / "dumps"
     dumps.mkdir(parents=True)
     counts = dispatch_counts(a.input, a.work_dir, flags)
-    run(BIN / "iree-compile", a.input, *flags, f"--iree-hal-dump-executable-benchmarks-to={dumps}",
+    run(COMPILER, a.input, *flags, f"--iree-hal-dump-executable-benchmarks-to={dumps}",
         "-o", a.work_dir / "full.vmfb")
 
     times = {}
     for mlir in sorted(dumps.glob("*.mlir")):
+        if mlir.name.startswith("module__initializer"):
+            continue
         name, us = bench_one(mlir, a.work_dir, a.batch)
         times[name] = us
         print(f"  {name} {us:.1f} us", file=sys.stderr)
 
     rows = []
-    for symbol, n in counts.items():
-        d, kind = re.match(r"main\$async_(dispatch_\d+)_(\w+)", symbol).groups()
-        rows.append((n * times[d], n, times[d], d, kind))
+    for (exe, export), n in counts.items():
+        m = re.match(r"main\$async_(dispatch_\d+)_(\w+)", export)
+        d, kind = m.groups() if m else (exe, export)
+        rows.append((n * times[exe], n, times[exe], d, kind))
     total = sum(r[0] for r in rows)
-    print(f"{'dispatch':13s} {'kind':45s} {'calls':>5s} {'each':>9s} {'total':>9s} {'share':>6s}  rate")
+    print(f"{'dispatch':17s} {'kind':45s} {'calls':>5s} {'each':>9s} {'total':>9s} {'share':>6s}  rate")
     for t, n, us, d, kind in sorted(rows, reverse=True):
         f = flops(kind)
         rate = f"{f / us / 1e6:.2f} TFLOPS" if f else ""
-        print(f"{d:13s} {kind:45s} {n:5d} {us / 1e3:6.2f} ms {t / 1e3:6.1f} ms {100 * t / total:5.1f}%  {rate}")
+        print(f"{d:17s} {kind:45s} {n:5d} {us / 1e3:6.2f} ms {t / 1e3:6.1f} ms {100 * t / total:5.1f}%  {rate}")
     print(f"total {total / 1e3:.1f} ms over {sum(counts.values())} dispatches")
 
 

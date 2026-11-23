@@ -1,0 +1,159 @@
+diff --git a/compiler/plugins/target/MetalSPIRV/MetalSPIRVTarget.cpp b/compiler/plugins/target/MetalSPIRV/MetalSPIRVTarget.cpp
+index feb61b2..2c15286 100644
+--- a/compiler/plugins/target/MetalSPIRV/MetalSPIRVTarget.cpp
++++ b/compiler/plugins/target/MetalSPIRV/MetalSPIRVTarget.cpp
+@@ -124,6 +124,11 @@ public:
+   LogicalResult serializeExecutable(const SerializationOptions &serOptions,
+                                     IREE::HAL::ExecutableVariantOp variantOp,
+                                     OpBuilder &executableBuilder) final {
++    if (variantOp.isExternal()) {
++      return serializeExternalExecutable(serOptions, variantOp,
++                                         executableBuilder);
++    }
++
+     ModuleOp innerModuleOp = variantOp.getInnerModule();
+ 
+     // TODO: rework this to compile all modules into the same metallib and
+@@ -323,6 +328,142 @@ public:
+     return success();
+   }
+ 
++  // Serializes an external variant, such as one produced by
++  // hal.dispatch.extern, whose single object is a precompiled .metallib or an
++  // MSL source file. Each hal.executable.export names a kernel function in the
++  // object and must declare a workgroup_size, which becomes the Metal
++  // threadgroup size.
++  //
++  // Kernels use the same binding ABI as generated ones: bindings in an
++  // argument buffer at [[buffer(0)]] with [[id(N)]] being the binding ordinal,
++  // and constants as an array of 32-bit values at [[buffer(3)]].
++  LogicalResult
++  serializeExternalExecutable(const SerializationOptions &serOptions,
++                              IREE::HAL::ExecutableVariantOp variantOp,
++                              OpBuilder &executableBuilder) {
++    std::optional<ArrayAttr> objects = variantOp.getObjects();
++    if (!objects || objects->size() != 1) {
++      return variantOp.emitOpError()
++             << "external Metal variants need exactly one object (a "
++                ".metallib or an MSL source file)";
++    }
++    auto objectAttr = cast<IREE::HAL::ExecutableObjectAttr>((*objects)[0]);
++    std::optional<std::string> data = objectAttr.loadData();
++    if (!data) {
++      return variantOp.emitOpError()
++             << "object file could not be loaded: " << objectAttr;
++    }
++
++    // A metallib starts with the "MTLB" magic; anything else is MSL source,
++    // compiled here like generated MSL unless metallib compilation is off.
++    std::unique_ptr<llvm::MemoryBuffer> metallib;
++    std::string source;
++    if (StringRef(*data).starts_with("MTLB")) {
++      metallib = llvm::MemoryBuffer::getMemBufferCopy(*data);
++    } else {
++      source = std::move(*data);
++      auto hostTriple = llvm::Triple(llvm::sys::getProcessTriple());
++      if (options.compileToMetalLib && hostTriple.isMacOSX()) {
++        metallib = compileMSLToMetalLib(options.targetPlatform, source,
++                                        variantOp.getName());
++        if (!metallib) {
++          return variantOp.emitOpError()
++                 << "failed to compile MSL object to a metallib: "
++                 << objectAttr;
++        }
++      }
++    }
++
++    FlatbufferBuilder builder;
++    iree_hal_metal_ExecutableDef_start_as_root(builder);
++    auto sourceFilesRef = createSourceFilesVec(
++        serOptions.debugLevel, variantOp.getSourcesAttr(), builder);
++
++    iree_hal_metal_MSLSourceDef_ref_t sourceRef = 0;
++    if (!source.empty() && (!metallib || serOptions.debugLevel > 1)) {
++      unsigned version = 196608; // MTLLanguageVersion3_0
++      sourceRef = iree_hal_metal_MSLSourceDef_create(
++          builder, version, builder.createString(source));
++    }
++    flatbuffers_string_ref_t metallibRef = 0;
++    if (metallib) {
++      metallibRef = flatbuffers_string_create(
++          builder, metallib->getBufferStart(), metallib->getBufferSize());
++    }
++    iree_hal_metal_LibraryDef_start(builder);
++    iree_hal_metal_LibraryDef_source_add(builder, sourceRef);
++    iree_hal_metal_LibraryDef_metallib_add(builder, metallibRef);
++    SmallVector<iree_hal_metal_LibraryDef_ref_t> libraryRefs = {
++        iree_hal_metal_LibraryDef_end(builder)};
++    auto librariesRef = builder.createOffsetVecDestructive(libraryRefs);
++
++    auto exportOps = llvm::to_vector_of<IREE::HAL::ExecutableExportOp>(
++        variantOp.getExportOps());
++    auto exportDebugInfos =
++        createExportDefs(serOptions.debugLevel, exportOps, builder);
++
++    SmallVector<iree_hal_metal_PipelineDef_ref_t> pipelineRefs;
++    for (auto [i, exportOp] : llvm::enumerate(exportOps)) {
++      std::optional<ArrayAttr> workgroupSize = exportOp.getWorkgroupSize();
++      if (!workgroupSize || workgroupSize->size() != 3) {
++        return exportOp.emitOpError()
++               << "external Metal exports need a 3D workgroup_size";
++      }
++      auto dim = [&](unsigned d) {
++        return static_cast<uint32_t>(
++            cast<IntegerAttr>((*workgroupSize)[d]).getInt());
++      };
++      iree_hal_metal_ThreadgroupSize_t threadgroupSize = {dim(0), dim(1),
++                                                          dim(2)};
++
++      auto layoutAttr = exportOp.getLayoutAttr();
++      uint32_t constantCount = static_cast<uint32_t>(layoutAttr.getConstants());
++      SmallVector<iree_hal_metal_BindingBits_enum_t> bindingFlags;
++      for (auto bindingAttr : layoutAttr.getBindings()) {
++        iree_hal_metal_BindingBits_enum_t flags = 0;
++        if (allEnumBitsSet(bindingAttr.getFlags(),
++                           IREE::HAL::DescriptorFlags::ReadOnly)) {
++          flags |= iree_hal_metal_BindingBits_IMMUTABLE;
++        }
++        bindingFlags.push_back(flags);
++      }
++      auto bindingFlagsRef = iree_hal_metal_BindingBits_vec_create(
++          builder, bindingFlags.data(), bindingFlags.size());
++
++      // The export symbol is both the kernel function name in the object and
++      // the name the runtime looks the export up by.
++      auto entryPointRef = builder.createString(exportOp.getName());
++      auto exportNameRef = builder.createString(exportOp.getName());
++      iree_hal_metal_PipelineDef_start(builder);
++      iree_hal_metal_PipelineDef_library_ordinal_add(builder, 0);
++      iree_hal_metal_PipelineDef_entry_point_add(builder, entryPointRef);
++      iree_hal_metal_PipelineDef_name_add(builder, exportNameRef);
++      iree_hal_metal_PipelineDef_threadgroup_size_add(builder,
++                                                      &threadgroupSize);
++      iree_hal_metal_PipelineDef_constant_count_add(builder, constantCount);
++      iree_hal_metal_PipelineDef_binding_flags_add(builder, bindingFlagsRef);
++      iree_hal_metal_PipelineDef_debug_info_add(builder, exportDebugInfos[i]);
++      pipelineRefs.push_back(iree_hal_metal_PipelineDef_end(builder));
++    }
++    auto pipelinesRef = builder.createOffsetVecDestructive(pipelineRefs);
++
++    iree_hal_metal_ExecutableDef_pipelines_add(builder, pipelinesRef);
++    iree_hal_metal_ExecutableDef_libraries_add(builder, librariesRef);
++    iree_hal_metal_ExecutableDef_source_files_add(builder, sourceFilesRef);
++    iree_hal_metal_ExecutableDef_end_as_root(builder);
++
++    auto binaryOp = IREE::HAL::ExecutableBinaryOp::create(
++        executableBuilder, variantOp.getLoc(), variantOp.getSymName(),
++        variantOp.getTarget().getFormat(),
++        builder.getHeaderPrefixedBufferAttr(
++            executableBuilder.getContext(),
++            /*magic=*/iree_hal_metal_ExecutableDef_file_identifier,
++            /*version=*/0));
++    binaryOp.setMimeTypeAttr(
++        executableBuilder.getStringAttr("application/x-flatbuffers"));
++    return success();
++  }
++
+ private:
+   const MetalSPIRVOptions &options;
+ };
