@@ -56,11 +56,19 @@ def detect_arch():
 # ahead of time, so the spec is written for one architecture: this machine's
 # by default, or the one given for a cross-compile.
 DEVICE_CLASS = None  # set with set_arch()
+# Whether GEMMs and attention use MLX's NAX (Metal 4 tensor ops) kernels, as MLX's
+# is_nax_available() decides: architecture generation 18 on phones (A19), 17
+# elsewhere (M5). Those kernels are built only into the iOS metallib.
+NAX = False
 
 
-def set_arch(arch):
-    global DEVICE_CLASS
+def set_arch(arch, nax=None):
+    """nax=None follows MLX; True or False overrides it."""
+    global DEVICE_CLASS, NAX
     DEVICE_CLASS = arch[-1]
+    digits = arch[-3:-1]
+    gen = int(digits) if digits.isdigit() else 0
+    NAX = gen >= (18 if DEVICE_CLASS == "p" else 17) if nax is None else nax
 
 
 def gemm_tile(batch, m, n, k, nt):
@@ -84,21 +92,46 @@ def gemm_tile(batch, m, n, k, nt):
 SWIZZLE = 0
 
 
+def gemm_nax_tile(m, n, k):
+    """(BM, BN, BK, WM, WN) as MLX's steel_matmul_regular_axpby_nax picks it;
+    all instantiated in mlx_gemm_nax.metal."""
+    if DEVICE_CLASS in "sc":
+        return (64, 128, 64 if k >= 8192 and k > m + n else 256, 2, 4)
+    if DEVICE_CLASS == "d":
+        return (128, 64, 512, 4, 2) if n > m else (64, 128, 512, 2, 4)
+    return (128, 128, 512, 4, 4)
+
+
+def gemm_nax_swizzle(m, n, bm):
+    """MLX's swizzle for the NAX GEMM."""
+    if DEVICE_CLASS in "sc":
+        return 2
+    if DEVICE_CLASS == "d":
+        return 0 if m > n else 2
+    return 0 if -(-m // bm) <= 3 else 1
+
+
 def kernel_name(batch, m, n, k, nt=False):
+    layout = "nt" if nt else "nn"
+    if NAX:
+        bm, bn, bk, wm, wn = gemm_nax_tile(m, n, k)
+        align = "".join("a" if d % t == 0 else "u" for d, t in ((m, bm), (n, bn), (k, bk)))
+        return f"mlx_gemm_nax_{layout}_f16_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_{align}"
     bm, bn, bk, wm, wn = gemm_tile(batch, m, n, k, nt)
     align = "".join("a" if d % t == 0 else "u" for d, t in ((m, bm), (n, bn), (k, bk)))
     align = align if align in ALIGNMENTS else "uuu"
-    return f"mlx_gemm_{'nt' if nt else 'nn'}_f16_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_{align}"
+    return f"mlx_gemm_{layout}_f16_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_{align}"
 
 
 def attention_tile(d):
-    """(BQ, BK, BD, BV, WM, WN) as MLX's sdpa_full (non-NAX) chooses it for
-    f16 and head dim d; instantiated in mlx_attention.metal for d = 64."""
+    """(BQ, BK, BD, BV, WM, WN) as MLX's sdpa_full chooses it for f16 and
+    head dim d, NAX or not; instantiated in mlx_attention.metal for d = 64."""
+    assert d == 64, f"no attention kernel instantiated for head dim {d}"
+    if NAX:
+        return (64, 32, d, d, 4, 1)
     devc = DEVICE_CLASS
     bk = 32 if (d == 256 and devc == "d") or d < 128 else 16
-    tile = (32, bk, d, d, 4, 2 if d == 256 else 1)
-    assert d == 64, f"no attention kernel instantiated for head dim {d}"
-    return tile
+    return (32, bk, d, d, 4, 2 if d == 256 else 1)
 
 
 def attention_extern(q, k, v, b, l, h, d, metallib, result="%o", indent="    "):
@@ -106,7 +139,7 @@ def attention_extern(q, k, v, b, l, h, d, metallib, result="%o", indent="    "):
     tensors with scale D^-0.5. Returns (lines, result type)."""
     bq, bk, bd, bv, wm, wn = attention_tile(d)
     align = ("a" if l % bq == 0 else "u") + ("a" if l % bk == 0 else "u")
-    name = f"mlx_attention_f16_bq{bq}_bk{bk}_bd{bd}_bv{bv}_wm{wm}_wn{wn}_{align}"
+    name = f"mlx_attention{'_nax' if NAX else ''}_f16_bq{bq}_bk{bk}_bd{bd}_bv{bv}_wm{wm}_wn{wn}_{align}"
     t = f"tensor<{b}x{l}x{h * d}xf16>"
     scale_bits = int.from_bytes(struct.pack("<f", d ** -0.5), "little")
     strides = [l * h * d, d, h * d]  # batch, head, row of [B, L, H, D]
@@ -146,10 +179,21 @@ def gemm_extern(a, b, batch, m, n, k, metallib, nt=False, a_type=None, b_type=No
     a_type = a_type or f"tensor<{prefix}{m}x{k}xf16>"
     b_type = b_type or (f"tensor<{prefix}{n}x{k}xf16>" if nt else f"tensor<{prefix}{k}x{n}xf16>")
     d_type = f"tensor<{prefix}{m}x{n}xf16>"
-    bm, bn, _, wm, wn = gemm_tile(batch or 1, m, n, k, nt)
-    tiles_m, tiles_n = -(-m // bm), -(-n // bn)
-    grid = (tiles_n << SWIZZLE, -(-tiles_m // (1 << SWIZZLE)), batch or 1)
-    consts = [m, n, k, k, k if nt else n, n, m * k, n * k, m * n, SWIZZLE]
+    lda, ldb, ldd = k, k if nt else n, n
+    if NAX:
+        # MLX's GEMMParams, int64 batch strides as (low, high) words, padded
+        # to its 8-byte alignment. batch_ndim is unused without batching.
+        bm, bn, bk, wm, wn = gemm_nax_tile(m, n, k)
+        swizzle = gemm_nax_swizzle(m, n, bm)
+        tiles_m, tiles_n = -(-m // bm), -(-n // bn)
+        consts = [m, n, k, lda, ldb, ldd, tiles_n, tiles_m, m * k, 0, n * k, 0, m * n, 0,
+                  swizzle, k // bk, 1, 0]
+    else:
+        bm, bn, _, wm, wn = gemm_tile(batch or 1, m, n, k, nt)
+        swizzle = SWIZZLE
+        tiles_m, tiles_n = -(-m // bm), -(-n // bn)
+        consts = [m, n, k, lda, ldb, ldd, m * k, n * k, m * n, swizzle]
+    grid = (tiles_n << swizzle, -(-tiles_m // (1 << swizzle)), batch or 1)
     lines = [f"%c{i} = arith.constant {v} : i32" for i, v in enumerate(consts)]
     # The workload is the problem size. The grid does not need it, but IREE
     # keys per-dispatch benchmarks on it, so each shape is benchmarked on its
@@ -318,8 +362,10 @@ def main():
                    help="BxLxHxD of a torch multi-head attention (scale D^-0.5) to replace")
     p.add_argument("--arch", help="Metal GPU architecture to pick MLX tiles for, e.g. applegpu_g14s "
                    "(default: this machine's GPU)")
+    p.add_argument("--nax", choices=["auto", "on", "off"], default="auto",
+                   help="NAX GEMMs and attention: as MLX decides from the architecture (auto), or forced")
     a = p.parse_args()
-    set_arch(a.arch or detect_arch())
+    set_arch(a.arch or detect_arch(), {"auto": None, "on": True, "off": False}[a.nax])
     lib = a.metallib.resolve()
     shape = lambda s: tuple(int(x) for x in s.split("x"))
     rules = ([linear_rule(*shape(s), lib) for s in a.linear] + [gemm_rule(*shape(s), lib) for s in a.gemm]

@@ -287,12 +287,19 @@ _mlx-clone:
     test "$(git -C {{ quote(mlx_src) }} rev-parse HEAD)" = "{{ mlx_commit }}"
 
 # Compiles the MLX GEMM and attention wrappers into one metallib for an SDK
-# (macosx or iphoneos).
+# (macosx or iphoneos), with MLX's own Metal flags (-fno-fast-math). The iOS
+# one also has the NAX GEMM and attention, which need Metal 4 and iOS 26.2.
+mlx_metal_flags := "-O3 -fno-fast-math -Wno-c++17-extensions -Wno-c++20-extensions"
+# All AIR files of one metallib must target the same OS version.
+mlx_ios_min := "-mios-version-min=26.2"
+
 _mlx-metallib sdk out: _mlx-clone
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "kernels" / "gen_mlx_attention.py") }} {{ quote(mlx_src) }} {{ quote(mlx_kernels_out / "gen") }}
-    xcrun -sdk {{ sdk }} metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -c {{ quote(metal_compiler / "kernels" / "mlx_gemm.metal") }} -o {{ quote(mlx_kernels_out / "mlx_gemm." + sdk + ".air") }}
-    xcrun -sdk {{ sdk }} metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -I {{ quote(mlx_kernels_out / "gen") }} -c {{ quote(metal_compiler / "kernels" / "mlx_attention.metal") }} -o {{ quote(mlx_kernels_out / "mlx_attention." + sdk + ".air") }}
-    xcrun -sdk {{ sdk }} metallib {{ quote(mlx_kernels_out / "mlx_gemm." + sdk + ".air") }} {{ quote(mlx_kernels_out / "mlx_attention." + sdk + ".air") }} -o {{ quote(out) }}
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "kernels" / "gen_mlx_kernels.py") }} {{ quote(mlx_src) }} {{ quote(mlx_kernels_out / "gen") }}
+    xcrun -sdk {{ sdk }} metal {{ mlx_metal_flags }} {{ if sdk == "iphoneos" { mlx_ios_min } else { "" } }} -I {{ quote(mlx_src) }} -c {{ quote(metal_compiler / "kernels" / "mlx_gemm.metal") }} -o {{ quote(mlx_kernels_out / "mlx_gemm." + sdk + ".air") }}
+    xcrun -sdk {{ sdk }} metal {{ mlx_metal_flags }} {{ if sdk == "iphoneos" { mlx_ios_min } else { "" } }} -I {{ quote(mlx_src) }} -I {{ quote(mlx_kernels_out / "gen") }} -c {{ quote(metal_compiler / "kernels" / "mlx_attention.metal") }} -o {{ quote(mlx_kernels_out / "mlx_attention." + sdk + ".air") }}
+    {{ if sdk == "iphoneos" { "xcrun -sdk iphoneos metal " + mlx_metal_flags + " " + mlx_ios_min + " -I " + quote(mlx_src) + " -I " + quote(mlx_kernels_out / "gen") + " -c " + quote(metal_compiler / "kernels" / "mlx_gemm_nax.metal") + " -o " + quote(mlx_kernels_out / "mlx_gemm_nax.iphoneos.air") } else { "true" } }}
+    {{ if sdk == "iphoneos" { "xcrun -sdk iphoneos metal " + mlx_metal_flags + " " + mlx_ios_min + " -DMLX_NAX -I " + quote(mlx_src) + " -I " + quote(mlx_kernels_out / "gen") + " -c " + quote(metal_compiler / "kernels" / "mlx_attention.metal") + " -o " + quote(mlx_kernels_out / "mlx_attention_nax.iphoneos.air") } else { "true" } }}
+    xcrun -sdk {{ sdk }} metallib {{ quote(mlx_kernels_out / "mlx_gemm." + sdk + ".air") }} {{ quote(mlx_kernels_out / "mlx_attention." + sdk + ".air") }} {{ if sdk == "iphoneos" { quote(mlx_kernels_out / "mlx_gemm_nax.iphoneos.air") + " " + quote(mlx_kernels_out / "mlx_attention_nax.iphoneos.air") } else { "" } }} -o {{ quote(out) }}
 
 [doc("Compile the MLX steel GEMM and attention wrappers (kernels/) into one metallib")]
 [macos]
@@ -344,6 +351,8 @@ ios_team := env("IREE_IOS_TEAM", "")
 ios_device := env("IREE_IOS_DEVICE", "")
 # The app prints the GPU's architecture name; applegpu_g18p is the A19 Pro.
 ios_gpu_arch := "applegpu_g18p"
+# NAX GEMMs and attention: auto (as MLX decides from the architecture), on or off.
+ios_nax := "auto"
 ios_lib := mlx_kernels_out / "mlx_kernels.ios.metallib"
 ios_results := bioclip_out / "ios"
 
@@ -359,19 +368,35 @@ ios-iree-runtime: _iree-clone
     cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(ios_runtime_build) }} -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 {{ iree_cmake_flags }}
     ninja -C {{ quote(ios_runtime_build) }} -j4 iree_runtime_unified flatcc_parsing
 
-# Needs `just metal-iree-compiler`, `just ios-iree-runtime` and the SDPA
-# export's input phase from `just bioclip-metal-mlx`.
-[doc("Run the BioCLIP 2 encoder with MLX kernels on an iPhone and compare it against the fp32 reference")]
-[macos]
-bioclip-ios-mlx: (_mlx-metallib "iphoneos" ios_lib)
+# Builds, installs and runs the app with what is staged in its Model/, then
+# scores the run; results go to <out>/ios.<name>.
+_ios-run name:
     test -n "{{ ios_team }}" -a -n "{{ ios_device }}" || { echo "set IREE_IOS_TEAM and IREE_IOS_DEVICE"; exit 1; }
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(ios_lib) }} {{ quote(bioclip_out / "vision.b1.r224.f16.mlx.ios.spec.mlir") }} {{ bioclip_mlx_rules }} --arch {{ ios_gpu_arch }}
-    mkdir -p {{ quote(ios_app / "Model") }} {{ quote(ios_results) }}
-    {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / "vision.b1.r224.f16.input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-metal-target-platform=ios --iree-preprocessing-transform-spec-filename={{ quote(bioclip_out / "vision.b1.r224.f16.mlx.ios.spec.mlir") }} -o {{ quote(ios_app / "Model" / "model.vmfb") }}
     {{ quote(metal_py) }} -c "import numpy as np, sys; np.load(sys.argv[1]).astype(np.float16).tofile(sys.argv[2])" {{ quote(bioclip_out / "pixels.npy") }} {{ quote(ios_app / "Model" / "pixels.f16") }}
     cd {{ quote(ios_app) }} && BENCH_TEAM={{ ios_team }} BENCH_BUNDLE_ID={{ ios_bundle_id }} xcodegen generate --quiet
     xcodebuild -project {{ quote(ios_app / "BenchBioclip.xcodeproj") }} -scheme BenchBioclip -configuration Release -destination "id=$(xcrun devicectl list devices | awk -v d={{ quote(ios_device) }} 'index($0, d) { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F]{8}-[0-9A-F]{16}$/) print $i }' | head -1)" -derivedDataPath {{ quote(ios_app / "build") }} -allowProvisioningUpdates -quiet build
     xcrun devicectl device install app --device {{ quote(ios_device) }} {{ quote(ios_app / "build" / "Build" / "Products" / "Release-iphoneos" / "BenchBioclip.app") }} > /dev/null
     xcrun devicectl device process launch --device {{ quote(ios_device) }} --console --terminate-existing {{ ios_bundle_id }} | grep BENCH
-    for f in embeddings.bin result.json; do xcrun devicectl device copy from --device {{ quote(ios_device) }} --domain-type appDataContainer --domain-identifier {{ ios_bundle_id }} --source "Documents/$f" --destination {{ quote(ios_results) }}/"$f" > /dev/null; done
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(ios_results / "result.json") }}
+    mkdir -p {{ quote(bioclip_out / "ios." + name) }}
+    for f in embeddings.bin result.json; do xcrun devicectl device copy from --device {{ quote(ios_device) }} --domain-type appDataContainer --domain-identifier {{ ios_bundle_id }} --source "Documents/$f" --destination {{ quote(bioclip_out / "ios." + name) }}/"$f" > /dev/null; done
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(bioclip_out / "ios." + name / "result.json") }}
+
+# Needs `just metal-iree-compiler`, `just ios-iree-runtime` and the SDPA
+# export's input phase from `just bioclip-metal-mlx`.
+[doc("Run the BioCLIP 2 encoder with MLX kernels on an iPhone and compare it against the fp32 reference")]
+[macos]
+bioclip-ios-mlx: (_mlx-metallib "iphoneos" ios_lib)
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(ios_lib) }} {{ quote(bioclip_out / "vision.b1.r224.f16.mlx.ios.spec.mlir") }} {{ bioclip_mlx_rules }} --arch {{ ios_gpu_arch }} --nax {{ ios_nax }}
+    rm -rf {{ quote(ios_app / "Model") }} && mkdir -p {{ quote(ios_app / "Model") }}
+    {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / "vision.b1.r224.f16.input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-metal-target-platform=ios --iree-preprocessing-transform-spec-filename={{ quote(bioclip_out / "vision.b1.r224.f16.mlx.ios.spec.mlir") }} -o {{ quote(ios_app / "Model" / "model.vmfb") }}
+    just _ios-run mlx.nax-{{ ios_nax }}
+
+# The Core ML reference on the phone (compute units ALL, so the Neural
+# Engine where Core ML places it). Needs the package from `just bioclip-export`.
+[doc("Run the BioCLIP 2 Core ML package on an iPhone and compare it against the fp32 reference")]
+[macos]
+bioclip-ios-coreml:
+    rm -rf {{ quote(ios_app / "Model") }} && mkdir -p {{ quote(ios_app / "Model") }}
+    xcrun coremlcompiler compile {{ quote(bioclip_out / "vision.r224.ios18.mlpackage") }} {{ quote(ios_app / "Model") }} > /dev/null
+    mv {{ quote(ios_app / "Model" / "vision.r224.ios18.mlmodelc") }} {{ quote(ios_app / "Model" / "model.mlmodelc") }}
+    just _ios-run coreml

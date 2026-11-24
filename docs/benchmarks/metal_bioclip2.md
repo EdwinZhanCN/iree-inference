@@ -27,10 +27,20 @@ and the [root justfile](../../justfile) produce every number below.
 
 The kernel sources are MLX's own code, vendored at a pinned commit.
 [`mlx_gemm.metal`](../../compiler/targets/metal/kernels/mlx_gemm.metal) keeps the
-steel GEMM body. [`gen_mlx_attention.py`](../../compiler/targets/metal/kernels/gen_mlx_attention.py)
-extracts the steel attention body unchanged for [`mlx_attention.metal`](../../compiler/targets/metal/kernels/mlx_attention.metal).
+steel GEMM body. [`gen_mlx_kernels.py`](../../compiler/targets/metal/kernels/gen_mlx_kernels.py)
+extracts three kernel bodies unchanged: steel attention for
+[`mlx_attention.metal`](../../compiler/targets/metal/kernels/mlx_attention.metal),
+its NAX version for the same file built with `-DMLX_NAX`, and the NAX steel
+GEMM for [`mlx_gemm_nax.metal`](../../compiler/targets/metal/kernels/mlx_gemm_nax.metal).
 MLX's function constants become template parameters or fixed locals, because
-IREE cannot set them.
+IREE cannot set them. Kernels are compiled with MLX's flags, including
+`-fno-fast-math`.
+
+NAX kernels use the Metal 4 tensor ops of GPUs with neural accelerators.
+They need iOS 26.2 and are built only into the iOS metallib. As in MLX's
+`is_nax_available()`, they are used when the architecture generation is at
+least 18 on a phone (A19) or 17 elsewhere (M5). `just ios_nax=off` forces the
+regular kernels.
 
 Tiles and swizzle follow MLX's own selection (`GEMM_TPARAM_MACRO` and
 `sdpa_full`) by device class, transposition and shape. MLX picks at run time
@@ -45,6 +55,16 @@ cross-compile. Every tile MLX can pick is instantiated.
 | `just bioclip-metal-mlx-gemm` | Decomposed export with attention as MLX GEMMs |
 | `just bioclip-metal-mlx-profile` | Per-dispatch breakdown of the MLX build |
 | `just mlx-kernel-test` | MLX kernels against NumPy and IREE's matmul |
+| `just ios-iree-runtime` | Cross-compiles the IREE runtime for iOS |
+| `just bioclip-ios-mlx` | MLX build on an iPhone (NAX where MLX would use it) |
+| `just bioclip-ios-coreml` | The Core ML package on the same iPhone |
+
+The iPhone recipes need `IREE_IOS_TEAM` (signing team) and
+`IREE_IOS_DEVICE` (device name or id). They build
+[`backends/ios/apps/bench_bioclip`](../../backends/ios/apps/bench_bioclip/),
+run it with the phone unlocked, copy the embeddings back and score them with
+`compare.py`. The app records the iOS thermal state at the start and end of
+each run.
 
 ## Correctness
 
@@ -128,3 +148,37 @@ Current breakdown (58.8 ms, 416 dispatches):
 GEMMs are 81% of the time. Folding bias and residual into the GEMM is
 estimated to save only about 2-3 ms. For reference, the Core ML export runs
 in about 36 ms on the same M2 Pro's Neural Engine.
+
+After the switch to `-fno-fast-math` the M2 Pro build measured 60.8 ms, with
+top-5 40/40. The 3 ms against 57.4 ms is within run-to-run variation here.
+
+## iPhone
+
+iPhone Air, A19 Pro GPU (`applegpu_g18p`), iOS 27.0.1. Each row is 30 timed
+calls after 5 warmup calls, thermal state nominal at the start and end.
+
+| Build | Call median | Load | Cosine min | Top-1 same | Top-5 same |
+| --- | --- | --- | --- | --- | --- |
+| MLX build, regular kernels (`ios_nax=off`) | 129.4 ms | 0.27 s | 0.99999 | 40/40 | 38/40 |
+| MLX build, NAX GEMM + attention | **41.9 ms** | 0.31 s | 0.99999 | 40/40 | 40/40 |
+| Core ML package, compute units all | 32.0 ms | 8.8 s first, 0.09 s cached | 0.99960 | 40/40 | 36/40 |
+
+- NAX makes the build 3.1x faster, and it then beats the M2 Pro's 57.4 ms.
+  MLX picks the 128x128x512 tile with 4x4 simdgroups for all three GEMM
+  shapes on a phone, and bq 64 for attention.
+- Core ML on the Neural Engine is about 10 ms faster, but less accurate. Its
+  first load compiles for the Neural Engine; iOS caches the result.
+- The phone throttles quickly. Back-to-back runs on a warm phone measured
+  141-320 ms for the regular build, so compare only runs that start and end
+  nominal.
+
+iOS build notes:
+
+- `iree-compile --iree-metal-target-platform=ios`. The MLX metallib is built
+  with `xcrun -sdk iphoneos`, and all its objects target iOS 26.2: a metallib
+  cannot link objects built for different OS versions.
+- [`patches/iree-metal-ios-simdgroup.patch`](../../compiler/targets/metal/patches/iree-metal-ios-simdgroup.patch)
+  turns on SPIRV-Cross's `ios_use_simdgroup_functions`. Without it the
+  LayerNorm reductions fail to translate to MSL.
+- [`patches/iree-ios-runtime.patch`](../../compiler/targets/metal/patches/iree-ios-runtime.patch)
+  lets the runtime's POSIX async platform build for iOS.

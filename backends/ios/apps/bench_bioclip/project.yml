@@ -43,4 +43,5 @@ targets:
           - -liree_runtime_unified
           - -lflatcc_parsing
           - -framework Metal
+          - -framework CoreML
           - -framework Foundation

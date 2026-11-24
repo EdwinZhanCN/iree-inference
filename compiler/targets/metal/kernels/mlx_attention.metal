@@ -1,8 +1,10 @@
 // MLX steel attention behind IREE's Metal binding ABI, for hal.dispatch.extern.
 //
 // The kernel body is MLX's (mlx/backend/metal/kernels/steel/attn/kernels/
-// steel_attention.h, MIT, Copyright 2024-26 Apple Inc.), extracted by
-// gen_mlx_attention.py into steel_attention_body.inc. MLX's function
+// steel_attention.h, or steel_attention_nax.h, its Metal 4 tensor-op version
+// for GPUs with neural accelerators, when compiled with -DMLX_NAX; MIT,
+// Copyright 2024-26 Apple Inc.), extracted by gen_mlx_kernels.py into
+// steel_attention[_nax]_body.inc. MLX's function
 // constants are template parameters (alignment) or fixed locals (no mask,
 // causal, sinks, logsumexp or window) under the same names.
 //
@@ -18,8 +20,16 @@
 #include <metal_stdlib>
 
 #include "mlx/backend/metal/kernels/utils.h"
+#ifdef MLX_NAX
+#include "steel_attention_nax_ops.h"
+#define MLX_ATTENTION_BODY "steel_attention_nax_body.inc"
+#define MLX_ATTENTION_PREFIX "mlx_attention_nax_f16"
+#else
 #include "mlx/backend/metal/kernels/steel/attn/attn.h"
 #include "steel_attention_ops.h"
+#define MLX_ATTENTION_BODY "steel_attention_body.inc"
+#define MLX_ATTENTION_PREFIX "mlx_attention_f16"
+#endif
 
 using namespace metal;
 using namespace mlx::steel;
@@ -98,13 +108,13 @@ template <
   const device T* sinks = nullptr;
   device float* lse = nullptr;
 
-#include "steel_attention_body.inc"
+#include MLX_ATTENTION_BODY
 }
 
-// Names: mlx_attention_f16_bq<>_bk<>_bd<>_bv<>_wm<>_wn<>_<Q><K>, where Q and K
+// Names: mlx_attention[_nax]_f16_bq<>_bk<>_bd<>_bv<>_wm<>_wn<>_<Q><K>, where Q and K
 // are a (sequence length a multiple of the block) or u.
 #define instantiate_attention(bq, bk, bd, bv, wm, wn, aq, ak, aname)          \
-  template [[host_name("mlx_attention_f16_bq" #bq "_bk" #bk "_bd" #bd "_bv" #bv \
+  template [[host_name(MLX_ATTENTION_PREFIX "_bq" #bq "_bk" #bk "_bd" #bd "_bv" #bv \
                        "_wm" #wm "_wn" #wn "_" aname)]] [[kernel]] void         \
   attention<half, bq, bk, bd, bv, wm, wn, aq, ak>(                              \
       constant AttnBindings<half>&, constant AttnConstants&, uint, uint, uint3, uint3);
@@ -115,5 +125,9 @@ template <
   instantiate_attention(bq, bk, bd, bv, wm, wn, true, false, "au")          \
   instantiate_attention(bq, bk, bd, bv, wm, wn, false, false, "uu")
 
-// MLX's choice for head dim 64 without NAX (bq 32, bk 32, wm 4, wn 1).
+// MLX's choice for head dim 64 (mlx_kernels.attention_tile).
+#ifdef MLX_NAX
+instantiate_attention_alignments(64, 32, 64, 64, 4, 1)
+#else
 instantiate_attention_alignments(32, 32, 64, 64, 4, 1)
+#endif

@@ -88,7 +88,9 @@ def load_device_run(path):
     result = json.loads(path.read_text())
     dtype = ELEMENT_TYPES[result["output_element_type"]]
     emb = np.fromfile(path.with_name("embeddings.bin"), dtype).reshape(result["images"], -1)
-    print(f"{result['gpu']} ({result['arch']}, iOS {result['os']}): load {result['load_ms']:.0f} ms")
+    thermal = " -> ".join(result.get("thermal_state", [])) or "unknown"
+    print(f"{result['gpu']} ({result['arch']}, iOS {result['os']}, {result.get('runtime', 'iree-metal')}): "
+          f"load {result['load_ms']:.0f} ms, thermal state {thermal}")
     # The first photo's first call, then the timed runs (after warm-up).
     return emb.astype(np.float32), [result["first_call_ms"][0] / 1e3] + [t / 1e3 for t in result["times_ms"]]
 
