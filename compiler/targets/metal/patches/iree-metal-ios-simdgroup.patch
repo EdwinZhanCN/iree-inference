@@ -1,14 +1,15 @@
 diff --git a/compiler/plugins/target/MetalSPIRV/SPIRVToMSL.cpp b/compiler/plugins/target/MetalSPIRV/SPIRVToMSL.cpp
-index 070ae48..31ce1d4 100644
+index 070ae48..d007adc 100644
 --- a/compiler/plugins/target/MetalSPIRV/SPIRVToMSL.cpp
 +++ b/compiler/plugins/target/MetalSPIRV/SPIRVToMSL.cpp
-@@ -103,6 +103,10 @@ public:
+@@ -103,6 +103,11 @@ public:
      case IREE::HAL::MetalTargetPlatform::iOS:
      case IREE::HAL::MetalTargetPlatform::iOSSimulator:
        spvCrossOptions.platform = SPIRVToMSLCompiler::Options::Platform::iOS;
-+      // Apple GPUs from the A13 on have SIMD-group functions. Without this,
-+      // SPIRV-Cross maps subgroup ops to quad-group ones and rejects
-+      // reductions.
++      // Use SIMD-group functions for subgroup ops, as on macOS. Otherwise
++      // SPIRV-Cross uses quad-group functions on iOS and rejects subgroup
++      // arithmetic, which the default Apple target enables. SIMD-group
++      // permutes need Apple6 (A13) and reductions Apple7 (A14).
 +      spvCrossOptions.ios_use_simdgroup_functions = true;
        break;
      }
