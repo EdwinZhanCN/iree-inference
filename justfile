@@ -356,16 +356,18 @@ ios_nax := "auto"
 ios_lib := mlx_kernels_out / "mlx_kernels.ios.metallib"
 ios_results := bioclip_out / "ios"
 
-# The posix async platform is gated to Darwin, Linux and Android, and iOS
-# reports CMAKE_SYSTEM_NAME iOS; iree-ios-runtime.patch adds it. Local-task
-# stays on: drivers/init.c includes the Metal driver header inside its #if.
+# The async POSIX platform's Bazel targets leave out iOS, which the async
+# library still selects there; iree-ios-runtime.patch adds it (the upstream
+# fix, including the regenerated CMakeLists.txt). Local-task stays on:
+# drivers/init.c includes the Metal driver header inside its #if. Uses the
+# host build's flatcc tool, so run `just iree` first.
 [doc("Cross-compile the IREE runtime for iOS arm64 into third_party/iree-build-ios")]
 [macos]
 ios-iree-runtime: _iree-clone
     test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
     git -C {{ quote(iree_src) }} submodule update --init --depth 1 {{ iree_submodules }}
     git -C {{ quote(iree_src) }} apply --reverse --check {{ quote(ios_runtime_patch) }} 2>/dev/null || git -C {{ quote(iree_src) }} apply {{ quote(ios_runtime_patch) }}
-    cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(ios_runtime_build) }} -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 {{ iree_cmake_flags }}
+    cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(ios_runtime_build) }} -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 -DIREE_HOST_BIN_DIR={{ quote(iree_build / "tools") }} {{ iree_cmake_flags }}
     ninja -C {{ quote(ios_runtime_build) }} -j4 iree_runtime_unified flatcc_parsing
 
 # Builds, installs and runs the app with what is staged in its Model/, then
