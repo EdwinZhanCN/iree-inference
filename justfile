@@ -251,7 +251,9 @@ bioclip-metal-profile:
 
 metal_iree_build := root / "third_party" / "iree-build-compiler"
 metal_iree_compile := metal_iree_build / "tools" / "iree-compile"
-metal_iree_patch := metal_compiler / "patches" / "iree-metal-external-executables.patch"
+# Compiler patches: external Metal executables, and SIMD-group functions for
+# iOS (SPIRV-Cross otherwise rejects reductions there).
+metal_iree_patches := quote(metal_compiler / "patches" / "iree-metal-external-executables.patch") + " " + quote(metal_compiler / "patches" / "iree-metal-ios-simdgroup.patch")
 metal_iree_cmake_flags := "-DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_BUILD_COMPILER=ON -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_BUILD_PYTHON_BINDINGS=OFF -DIREE_BUILD_BUNDLED_LLVM=ON -DIREE_INPUT_TORCH=OFF -DIREE_INPUT_STABLEHLO=OFF -DIREE_INPUT_TOSA=OFF -DIREE_TARGET_BACKEND_DEFAULTS=OFF -DIREE_TARGET_BACKEND_METAL_SPIRV=ON -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_LOCAL_SYNC=ON -DIREE_ENABLE_ASSERTIONS=OFF -DLLVM_PARALLEL_LINK_JOBS=1"
 mlx_commit := "c23a35c9e6f4b26a2b851dda8c9e0630d13069ad"
 mlx_src := root / "third_party" / "mlx"
@@ -271,12 +273,12 @@ bioclip_mlx_gemm_rules := bioclip_linears + " --gemm 16x257x257x64 --gemm 16x257
 
 # Builds LLVM and MLIR from source: about 30 minutes on an M2 Pro. 4 jobs keep
 # peak memory near 6 GB. A rebuild after a patch change takes a few minutes.
-[doc("Build iree-compile with the Metal external-executable patch into third_party/iree-build-compiler")]
+[doc("Build iree-compile with the Metal patches into third_party/iree-build-compiler")]
 [macos]
 metal-iree-compiler: _iree-clone
     test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
     git -C {{ quote(iree_src) }} submodule update --init --depth 1 third_party/llvm-project {{ iree_submodules }}
-    git -C {{ quote(iree_src) }} apply --reverse --check {{ quote(metal_iree_patch) }} || git -C {{ quote(iree_src) }} apply {{ quote(metal_iree_patch) }}
+    for p in {{ metal_iree_patches }}; do git -C {{ quote(iree_src) }} apply --reverse --check "$p" 2>/dev/null || git -C {{ quote(iree_src) }} apply "$p"; done
     cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(metal_iree_build) }} {{ metal_iree_cmake_flags }}
     ninja -C {{ quote(metal_iree_build) }} -j4 iree-compile
 
@@ -284,13 +286,17 @@ _mlx-clone:
     @{{ if path_exists(mlx_src / ".git") == "true" { "git -C " + quote(mlx_src) + " rev-parse --short HEAD" } else { "git init -q " + quote(mlx_src) + " && git -C " + quote(mlx_src) + " fetch -q --depth 1 https://github.com/ml-explore/mlx " + mlx_commit + " && git -C " + quote(mlx_src) + " checkout -q FETCH_HEAD" } }}
     test "$(git -C {{ quote(mlx_src) }} rev-parse HEAD)" = "{{ mlx_commit }}"
 
+# Compiles the MLX GEMM and attention wrappers into one metallib for an SDK
+# (macosx or iphoneos).
+_mlx-metallib sdk out: _mlx-clone
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "kernels" / "gen_mlx_attention.py") }} {{ quote(mlx_src) }} {{ quote(mlx_kernels_out / "gen") }}
+    xcrun -sdk {{ sdk }} metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -c {{ quote(metal_compiler / "kernels" / "mlx_gemm.metal") }} -o {{ quote(mlx_kernels_out / "mlx_gemm." + sdk + ".air") }}
+    xcrun -sdk {{ sdk }} metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -I {{ quote(mlx_kernels_out / "gen") }} -c {{ quote(metal_compiler / "kernels" / "mlx_attention.metal") }} -o {{ quote(mlx_kernels_out / "mlx_attention." + sdk + ".air") }}
+    xcrun -sdk {{ sdk }} metallib {{ quote(mlx_kernels_out / "mlx_gemm." + sdk + ".air") }} {{ quote(mlx_kernels_out / "mlx_attention." + sdk + ".air") }} -o {{ quote(out) }}
+
 [doc("Compile the MLX steel GEMM and attention wrappers (kernels/) into one metallib")]
 [macos]
-mlx-kernels: _mlx-clone
-    {{ quote(metal_py) }} {{ quote(metal_compiler / "kernels" / "gen_mlx_attention.py") }} {{ quote(mlx_src) }} {{ quote(mlx_kernels_out / "gen") }}
-    xcrun -sdk macosx metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -c {{ quote(metal_compiler / "kernels" / "mlx_gemm.metal") }} -o {{ quote(mlx_kernels_out / "mlx_gemm.air") }}
-    xcrun -sdk macosx metal -std=metal3.1 -O3 -Wno-c++17-extensions -I {{ quote(mlx_src) }} -I {{ quote(mlx_kernels_out / "gen") }} -c {{ quote(metal_compiler / "kernels" / "mlx_attention.metal") }} -o {{ quote(mlx_kernels_out / "mlx_attention.air") }}
-    xcrun -sdk macosx metallib {{ quote(mlx_kernels_out / "mlx_gemm.air") }} {{ quote(mlx_kernels_out / "mlx_attention.air") }} -o {{ quote(mlx_lib) }}
+mlx-kernels: (_mlx-metallib "macosx" mlx_lib)
 
 [doc("Check the MLX GEMM and attention kernels against NumPy and IREE's own codegen on the BioCLIP 2 shapes")]
 [macos]
@@ -321,3 +327,51 @@ bioclip-metal-mlx-gemm: (_bioclip-mlx "vision.b1.r224.f16.decomposed" bioclip_ml
 [doc("Per-dispatch GPU time breakdown of the MLX build (after bioclip-metal-mlx)")]
 [macos]
 bioclip-metal-mlx-profile: (_bioclip-mlx-profile "vision.b1.r224.f16")
+
+# --- iPhone -----------------------------------------------------------------
+# The encoder runs in backends/ios/apps/bench_bioclip, a small app that times
+# it and writes the embeddings, which compare.py then scores on the Mac. The
+# device needs Developer Mode, and the app's signing team trusted on it
+# (Settings > General > VPN & Device Management) after the first install.
+
+ios_runtime_build := root / "third_party" / "iree-build-ios"
+ios_runtime_patch := metal_compiler / "patches" / "iree-ios-runtime.patch"
+ios_app := root / "backends" / "ios" / "apps" / "bench_bioclip"
+ios_bundle_id := "dev.iree-inference.bench-bioclip"
+# Signing team ID (Xcode > Settings > Accounts) and device name or UDID
+# (`xcrun devicectl list devices`).
+ios_team := env("IREE_IOS_TEAM", "")
+ios_device := env("IREE_IOS_DEVICE", "")
+# The app prints the GPU's architecture name; applegpu_g18p is the A19 Pro.
+ios_gpu_arch := "applegpu_g18p"
+ios_lib := mlx_kernels_out / "mlx_kernels.ios.metallib"
+ios_results := bioclip_out / "ios"
+
+# The posix async platform is gated to Darwin, Linux and Android, and iOS
+# reports CMAKE_SYSTEM_NAME iOS; iree-ios-runtime.patch adds it. Local-task
+# stays on: drivers/init.c includes the Metal driver header inside its #if.
+[doc("Cross-compile the IREE runtime for iOS arm64 into third_party/iree-build-ios")]
+[macos]
+ios-iree-runtime: _iree-clone
+    test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
+    git -C {{ quote(iree_src) }} submodule update --init --depth 1 {{ iree_submodules }}
+    git -C {{ quote(iree_src) }} apply --reverse --check {{ quote(ios_runtime_patch) }} 2>/dev/null || git -C {{ quote(iree_src) }} apply {{ quote(ios_runtime_patch) }}
+    cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(ios_runtime_build) }} -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 {{ iree_cmake_flags }}
+    ninja -C {{ quote(ios_runtime_build) }} -j4 iree_runtime_unified flatcc_parsing
+
+# Needs `just metal-iree-compiler`, `just ios-iree-runtime` and the SDPA
+# export's input phase from `just bioclip-metal-mlx`.
+[doc("Run the BioCLIP 2 encoder with MLX kernels on an iPhone and compare it against the fp32 reference")]
+[macos]
+bioclip-ios-mlx: (_mlx-metallib "iphoneos" ios_lib)
+    test -n "{{ ios_team }}" -a -n "{{ ios_device }}" || { echo "set IREE_IOS_TEAM and IREE_IOS_DEVICE"; exit 1; }
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(ios_lib) }} {{ quote(bioclip_out / "vision.b1.r224.f16.mlx.ios.spec.mlir") }} {{ bioclip_mlx_rules }} --arch {{ ios_gpu_arch }}
+    mkdir -p {{ quote(ios_app / "Model") }} {{ quote(ios_results) }}
+    {{ quote(metal_iree_compile) }} {{ quote(bioclip_out / "vision.b1.r224.f16.input.mlirbc") }} --compile-from=input --iree-hal-target-device=metal --iree-metal-target-platform=ios --iree-preprocessing-transform-spec-filename={{ quote(bioclip_out / "vision.b1.r224.f16.mlx.ios.spec.mlir") }} -o {{ quote(ios_app / "Model" / "model.vmfb") }}
+    {{ quote(metal_py) }} -c "import numpy as np, sys; np.load(sys.argv[1]).astype(np.float16).tofile(sys.argv[2])" {{ quote(bioclip_out / "pixels.npy") }} {{ quote(ios_app / "Model" / "pixels.f16") }}
+    cd {{ quote(ios_app) }} && BENCH_TEAM={{ ios_team }} BENCH_BUNDLE_ID={{ ios_bundle_id }} xcodegen generate --quiet
+    xcodebuild -project {{ quote(ios_app / "BenchBioclip.xcodeproj") }} -scheme BenchBioclip -configuration Release -destination "id=$(xcrun devicectl list devices | awk -v d={{ quote(ios_device) }} 'index($0, d) { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F]{8}-[0-9A-F]{16}$/) print $i }' | head -1)" -derivedDataPath {{ quote(ios_app / "build") }} -allowProvisioningUpdates -quiet build
+    xcrun devicectl device install app --device {{ quote(ios_device) }} {{ quote(ios_app / "build" / "Build" / "Products" / "Release-iphoneos" / "BenchBioclip.app") }} > /dev/null
+    xcrun devicectl device process launch --device {{ quote(ios_device) }} --console --terminate-existing {{ ios_bundle_id }} | grep BENCH
+    for f in embeddings.bin result.json; do xcrun devicectl device copy from --device {{ quote(ios_device) }} --domain-type appDataContainer --domain-identifier {{ ios_bundle_id }} --source "Documents/$f" --destination {{ quote(ios_results) }}/"$f" > /dev/null; done
+    {{ quote(metal_py) }} {{ quote(metal_compiler / "compare.py") }} {{ quote(bioclip_out) }} {{ quote(bioclip_datasets) }} {{ quote(ios_results / "result.json") }}

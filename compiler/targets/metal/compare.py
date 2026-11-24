@@ -7,7 +7,9 @@ reference`), then compares, per photo, the embedding with ref.fp32.npy
   compare.py <ref_dir> <dataset_dir> <artifact> [--device metal] [--function b1]
 
 <artifact> is an IREE .vmfb (batch read from its vision.b<N>. name), a Core ML
-.mlpackage (run with compute units ALL) or an ONNX model. Exits non-zero
+.mlpackage (run with compute units ALL), an ONNX model, or the result.json
+an on-device run wrote (backends/ios/apps/bench_bioclip), with its
+embeddings.bin beside it. Exits non-zero
 when any embedding has cosine < 0.999 or any top-1 differs.
 """
 
@@ -77,6 +79,20 @@ def run_onnx(path, pixels):
     return np.concatenate(outs).astype(np.float32), times
 
 
+# IREE HAL element types of float outputs.
+ELEMENT_TYPES = {0x21000010: np.float16, 0x21000020: np.float32}
+
+
+def load_device_run(path):
+    """Embeddings and call times recorded on a device by the bench app."""
+    result = json.loads(path.read_text())
+    dtype = ELEMENT_TYPES[result["output_element_type"]]
+    emb = np.fromfile(path.with_name("embeddings.bin"), dtype).reshape(result["images"], -1)
+    print(f"{result['gpu']} ({result['arch']}, iOS {result['os']}): load {result['load_ms']:.0f} ms")
+    # The first photo's first call, then the timed runs (after warm-up).
+    return emb.astype(np.float32), [result["first_call_ms"][0] / 1e3] + [t / 1e3 for t in result["times_ms"]]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("ref_dir")
@@ -94,6 +110,8 @@ def main():
     art = Path(a.artifact)
     if art.suffix == ".vmfb":
         emb, times = run_iree(art, pixels, a.device)
+    elif art.suffix == ".json":
+        emb, times = load_device_run(art)
     elif art.suffix == ".mlpackage":
         emb, times = run_coreml(art, pixels, a.function)
     else:

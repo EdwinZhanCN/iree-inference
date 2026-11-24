@@ -1,0 +1,46 @@
+# XcodeGen spec for the BioCLIP 2 IREE Metal benchmark app.
+# `just ios-bioclip-bench` stages Model/, generates the project and
+# builds it; the signing team and bundle id come from the justfile.
+name: BenchBioclip
+options:
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    IREE_SOURCE_DIR: ../../../../third_party/iree
+    IREE_IOS_BUILD_DIR: ../../../../third_party/iree-build-ios
+targets:
+  BenchBioclip:
+    type: application
+    platform: iOS
+    sources:
+      - path: src
+      - path: Model
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ${BENCH_BUNDLE_ID}
+        DEVELOPMENT_TEAM: ${BENCH_TEAM}
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        CLANG_ENABLE_OBJC_ARC: YES
+        # As in the runtime build; iree_allocator_system() needs it.
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - IREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl
+        HEADER_SEARCH_PATHS:
+          - $(IREE_SOURCE_DIR)/runtime/src
+          - $(IREE_IOS_BUILD_DIR)/runtime/src
+        LIBRARY_SEARCH_PATHS:
+          - $(IREE_IOS_BUILD_DIR)/runtime/src/iree/runtime
+          - $(IREE_IOS_BUILD_DIR)/build_tools/third_party/flatcc
+        OTHER_LDFLAGS:
+          - -liree_runtime_unified
+          - -lflatcc_parsing
+          - -framework Metal
+          - -framework Foundation
