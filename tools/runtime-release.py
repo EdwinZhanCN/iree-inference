@@ -64,8 +64,14 @@ def native_build(profile, target):
         for driver in ("metal", "vulkan", "cuda")
     ]
     if target == "aarch64-pc-windows-msvc":
-        # The fork probes Clang/GCC-only flags but MSVC sees empty probes as
-        # successes and then tries to build the optional Arm ISA variants.
+        # The baseline NEON kernels use Clang vector and FP16 intrinsics.
+        # Keep the MSVC ABI while compiling them with Clang's CL frontend.
+        opts.extend(
+            f"-DCMAKE_{language}_COMPILER{suffix}={value}"
+            for language in ("C", "CXX")
+            for suffix, value in (("", "clang-cl"), ("_TARGET", target))
+        )
+        # The fork has no clang-cl feature flags for the optional Arm variants.
         opts.extend(
             f"-DIREE_UK_BUILD_ARM_64_{isa}:BOOL=OFF"
             for isa in ("FULLFP16", "FP16FML", "BF16", "DOTPROD", "I8MM")
