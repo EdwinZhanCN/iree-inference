@@ -54,7 +54,7 @@ def supports(target, profile):
     return not ("cuda" in profile and target == "aarch64-pc-windows-msvc")
 
 
-def native_build(profile):
+def native_build(profile, target):
     run("just", "_iree-clone", cwd=ROOT)
     if "vulkan" in profile:
         run("git", "-C", ROOT / "third_party/iree-3.14", "submodule", "update",
@@ -63,6 +63,13 @@ def native_build(profile):
         f"-DIREE_HAL_DRIVER_{driver.upper()}={'ON' if driver in profile else 'OFF'}"
         for driver in ("metal", "vulkan", "cuda")
     ]
+    if target == "aarch64-pc-windows-msvc":
+        # The fork probes Clang/GCC-only flags but MSVC sees empty probes as
+        # successes and then tries to build the optional Arm ISA variants.
+        opts.extend(
+            f"-DIREE_UK_BUILD_ARM_64_{isa}:BOOL=OFF"
+            for isa in ("FULLFP16", "FP16FML", "BF16", "DOTPROD", "I8MM")
+        )
     run("just", "iree", *opts, cwd=ROOT)
 
 
@@ -89,7 +96,15 @@ def package(target, profile, output, build):
     ):
         filename = f"{library}.lib" if target.endswith("-msvc") else f"lib{library}.a"
         path = output / f"{stem}-{filename}"
-        shutil.copyfile(build / directory / filename, path)
+        archive = build / directory / filename
+        if library == "iree_runtime_unified" and target == "x86_64-pc-windows-msvc":
+            # The fork adds the MASM thunk to the ELF arch static target.
+            # The unified runtime aggregates object targets and omits it.
+            run("cmake", "--build", build, "--target", "iree_hal_local_elf_arch")
+            thunk = build / "runtime/src/iree/hal/local/elf/arch/x86_64_msvc.obj"
+            run("lib.exe", "/NOLOGO", f"/OUT:{path.resolve()}", archive, thunk)
+        else:
+            shutil.copyfile(archive, path)
         with path.open("rb") as stream:
             files[filename] = hashlib.file_digest(stream, "sha256").hexdigest()
     licenses = (source, Path(source) / "third_party/flatcc")
@@ -167,7 +182,7 @@ def main():
     if host != args.target:
         cli.error(f"native packaging must run on {args.target}, found {host}")
     if not args.package_only:
-        native_build(args.profile)
+        native_build(args.profile, args.target)
     package(args.target, args.profile, args.output, args.build)
 
 
