@@ -311,6 +311,7 @@ mlx-kernel-test: mlx-kernels
 # Lowers an export to the input phase with the pip compiler, then compiles it
 # with the fork compiler and the MLX rules; the rest stays on IREE's
 # metal-spirv codegen.
+[macos]
 _bioclip-mlx stem rules: mlx-kernels
     {{ quote(metal_bin / "iree-compile" + esp_exe) }} {{ quote(bioclip_out / stem + ".mlirbc") }} --iree-hal-target-device=metal --compile-to=input --emit-mlir-bytecode -o {{ quote(bioclip_out / stem + ".input.mlirbc") }}
     {{ quote(metal_py) }} {{ quote(metal_compiler / "mlx_kernels.py") }} {{ quote(mlx_lib) }} {{ quote(bioclip_out / stem + ".mlx.spec.mlir") }} {{ rules }} {{ mlx_arch_flag }}
