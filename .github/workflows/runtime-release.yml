@@ -1,0 +1,121 @@
+name: Native runtime release
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Driver profile to build
+        type: choice
+        default: cpu
+        options: [cpu, metal, vulkan, cuda, vulkan-cuda]
+      publish:
+        description: Publish the tested assets to GitHub Releases
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-runtime-${{ inputs.profile }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+      revision: ${{ steps.matrix.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          echo "value=$(python3 tools/runtime-release.py matrix "$PROFILE")" >> "$GITHUB_OUTPUT"
+          echo "revision=$(cat crates/iree-sys/runtime-revision)" >> "$GITHUB_OUTPUT"
+
+      # The same embedded-ELF fixtures run on all three host operating systems.
+      - uses: astral-sh/setup-uv@v6
+      - name: Compile portable CPU smoke fixtures
+        run: |
+          mkdir fixtures
+          for arch in aarch64 x86_64; do
+            uvx --from iree-base-compiler==3.14.0 iree-compile testdata/basic.mlir \
+              --iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu \
+              --iree-llvmcpu-target-triple="${arch}-unknown-unknown-eabi-elf" \
+              --iree-llvmcpu-target-cpu=generic -o "fixtures/${arch}.vmfb"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-smoke-fixtures
+          path: fixtures/
+          if-no-files-found: error
+
+  native:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      PROFILE: ${{ inputs.profile }}
+      TARGET_TRIPLE: ${{ matrix.target }}
+      FIXTURE_ARCH: ${{ startsWith(matrix.target, 'aarch64') && 'aarch64' || 'x86_64' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Ensure Ninja is available
+        run: |
+          if (!(Get-Command ninja -ErrorAction SilentlyContinue)) { python -m pip install ninja }
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.arch }}
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-smoke-fixtures
+          path: fixtures/
+      - name: Build and package native runtime
+        run: python tools/runtime-release.py package $env:PROFILE $env:TARGET_TRIPLE assets
+      - name: Test a clean Cargo Git consumer
+        run: python tools/runtime-release.py smoke $env:PROFILE assets "fixtures/$env:FIXTURE_ARCH.vmfb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-files-${{ matrix.target }}
+          path: assets/
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: [prepare, native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROFILE: ${{ inputs.profile }}
+      REVISION: ${{ needs.prepare.outputs.revision }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-files-*
+          merge-multiple: true
+          path: assets/
+      - name: Publish verified runtime files
+        run: |
+          tag="runtime-v1-$REVISION-$PROFILE"
+          gh release create "$tag" assets/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "IREE runtime $PROFILE ($REVISION)" \
+            --notes "Native runtime files validated with a clean Cargo consumer." \
+            --latest=false

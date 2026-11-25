@@ -1,7 +1,3 @@
-# Pins LLVM for debug builds: some cargo builds default the dev profile to
-# Cranelift, whose code crashes across the IREE C FFI.
-cargo-features = ["codegen-backend"]
-
 [workspace]
 members = [
     "crates/iree-sys",
@@ -22,9 +18,6 @@ commit = "4ff3621d17896ee7b23d246a355ad915b9219a9e"
 
 # Tests: light optimisation only, so builds stay fast and stay debuggable.
 # Heavy compute (the embedding model on IREE) is C built by CMake in Release, unaffected.
-[profile.dev]
-codegen-backend = "llvm"
-
 [profile.test]
 opt-level = 1
 

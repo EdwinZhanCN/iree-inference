@@ -24,18 +24,18 @@ fmt-check:
     cargo fmt --all --check
 
 clippy:
-    cargo clippy --workspace --all-features --all-targets -- -D warnings
+    cargo clippy --workspace --features half --all-targets -- -D warnings
 
 # Unit and integration tests. `just test --profile ci` writes JUnit.
 test *args:
-    cargo nextest run --workspace --all-features {{ args }}
+    cargo nextest run --workspace --features half {{ args }}
 
 # The ignored GPU tests exercise the Metal module on macOS. Run on an idle
 # machine: other GPU work can fail allocations.
 [doc("GPU tests: IREE on Metal (macOS)")]
 [macos]
 test-gpu *args:
-    cargo nextest run --workspace --all-features --run-ignored only -E "test(/^gpu_/)" {{ args }}
+    cargo nextest run --workspace --features half --run-ignored only -E "test(/^gpu_/)" {{ args }}
 
 [linux]
 [windows]
@@ -44,7 +44,7 @@ test-gpu *args:
 
 # Doctests (nextest doesn't run them; iree-runtime's compile_fail checks live here).
 doctest:
-    cargo test --workspace --all-features --doc
+    cargo test --workspace --features half --doc
 
 # ---- IREE ---------------------------------------------------------------------
 # The C runtime, headers and Metal compiler come from the fork snapshot.
@@ -53,7 +53,7 @@ doctest:
 
 iree_version := "3.14.0"
 iree_repo := "https://github.com/EdwinZhanCN/iree.git"
-iree_commit := "4ff3621d17896ee7b23d246a355ad915b9219a9e"
+iree_commit := trim(read(root / "crates" / "iree-sys" / "runtime-revision"))
 iree_src := root / "third_party" / "iree-3.14"
 iree_build := root / "third_party" / "iree-build-3.14"
 iree_has_checkout := path_exists(iree_src / ".git")
@@ -71,7 +71,6 @@ iree *cmake_args: _iree-clone
     git -C {{ quote(iree_src) }} submodule update --init --depth 1 {{ iree_submodules }}
     cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(iree_build) }} {{ iree_cmake_flags }} {{ cmake_args }}
     ninja -C {{ quote(iree_build) }} iree_runtime_unified
-    cargo clean -p iree-sys
 
 _iree-clone:
     @{{ if iree_has_checkout == "true" { "" } else { "git init -q " + quote(iree_src) } }}

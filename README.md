@@ -13,6 +13,9 @@ The runtime, headers and Metal source compiler use the
 Python tooling uses the upstream IREE 3.14.0 packages. Rebuild VMFB modules
 when updating IREE because the bytecode ABI can change across versions.
 
+See [Consume the runtime crate](docs/runtime-packages.md) for Cargo Git
+dependencies, driver features and native release packaging.
+
 ## Build and test
 
 Install Rust (the version in `rust-toolchain.toml`), CMake, Ninja, `just`,
@@ -29,12 +32,9 @@ the required submodules, and builds into `third_party/iree-build-3.14`.
 macOS also enables Metal, and all platforms enable CPU drivers. Run
 `just test-gpu` on macOS for Metal tests (requires the Metal Toolchain).
 
-`IREE_SOURCE_DIR` and `IREE_RUNTIME_LIB_DIR` override the header checkout and
-runtime archive directory for external builds. The latter currently expects
-IREE's CMake build-tree layout for the separate `flatcc_parsing` archive.
-The caller is responsible for using matching versions. Without headers or the
-runtime archive, layout checks and runtime integration tests are skipped;
-that configuration does not validate an IREE build.
+`IREE_SOURCE_DIR` enables the C ABI layout checks against a local source tree.
+`IREE_RUNTIME_LIB_DIR` selects a local native runtime. It accepts both
+co-located libraries and the existing `just iree` build tree.
 
 The crates are Apache-2.0 licensed. They originate from the `iree-embed`
 project and earlier IREE-Rust-Exp work; see the source project for provenance.

@@ -10,6 +10,9 @@ publish.workspace = true
 default = []
 # `Element` impls for `half::f16` / `half::bf16`.
 half = ["dep:half"]
+metal = ["iree-sys/metal"]
+vulkan = ["iree-sys/vulkan"]
+cuda = ["iree-sys/cuda"]
 
 [dependencies]
 iree-sys.workspace = true
