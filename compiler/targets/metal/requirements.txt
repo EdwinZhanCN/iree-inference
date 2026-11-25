@@ -2,8 +2,8 @@
 # runtime pinned in the justfile / Cargo.toml (vmfb is not ABI-stable).
 torch==2.15.0
 open-clip-torch==4.2.2
-iree-base-compiler==3.13.0
-iree-base-runtime==3.13.0
+iree-base-compiler==3.14.0
+iree-base-runtime==3.14.0
 iree-turbine==3.9.0
 coremltools==9.0
 onnxruntime==1.32.0

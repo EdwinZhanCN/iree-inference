@@ -1,6 +1,6 @@
 [package]
 name = "iree-sys"
-description = "Hand-written raw FFI bindings to the IREE runtime C API (inference subset, IREE v3.13.0)."
+description = "Hand-written raw FFI bindings to the IREE runtime C API (inference subset, IREE 3.14-based fork)."
 version.workspace = true
 edition.workspace = true
 license = "Apache-2.0"

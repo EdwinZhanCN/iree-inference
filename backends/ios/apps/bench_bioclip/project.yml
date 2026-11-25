@@ -7,8 +7,8 @@ options:
     iOS: "18.0"
 settings:
   base:
-    IREE_SOURCE_DIR: ../../../../third_party/iree
-    IREE_IOS_BUILD_DIR: ../../../../third_party/iree-build-ios
+    IREE_SOURCE_DIR: ../../../../third_party/iree-3.14
+    IREE_IOS_BUILD_DIR: ../../../../third_party/iree-build-ios-3.14
 targets:
   BenchBioclip:
     type: application

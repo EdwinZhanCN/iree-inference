@@ -20,10 +20,12 @@ and the [root justfile](../../justfile) produce every number below.
      merge → MLX steel attention, which reads `[B, L, H, D]` through strides.
    - `--gemm BxMxNxK`: fill + batch_matmul → the nn GEMM. Used only for the
      decomposed export.
-4. The patched `iree-compile` compiles from the input phase with that spec.
-   The patch ([`patches/iree-metal-external-executables.patch`](../../compiler/targets/metal/patches/iree-metal-external-executables.patch))
-   adds external executables to the MetalSPIRV target. `just
-   metal-iree-compiler` builds it.
+4. The compiler from the pinned IREE fork compiles from the input phase with
+   that spec. The fork adds external executables to the MetalSPIRV target.
+   `just metal-iree-compiler` builds it.
+
+The measurements below were taken with IREE 3.13.0 and local patches.
+The build recipes now use the fork snapshot after 3.14.0.
 
 The kernel sources are MLX's own code, vendored at a pinned commit.
 [`mlx_gemm.metal`](../../compiler/targets/metal/kernels/mlx_gemm.metal) keeps the
@@ -177,8 +179,5 @@ iOS build notes:
 - `iree-compile --iree-metal-target-platform=ios`. The MLX metallib is built
   with `xcrun -sdk iphoneos`, and all its objects target iOS 26.2: a metallib
   cannot link objects built for different OS versions.
-- [`patches/iree-metal-ios-simdgroup.patch`](../../compiler/targets/metal/patches/iree-metal-ios-simdgroup.patch)
-  turns on SPIRV-Cross's `ios_use_simdgroup_functions`. Without it the
-  LayerNorm reductions fail to translate to MSL.
-- [`patches/iree-ios-runtime.patch`](../../compiler/targets/metal/patches/iree-ios-runtime.patch)
-  lets the runtime's POSIX async platform build for iOS.
+- The fork enables SPIRV-Cross's `ios_use_simdgroup_functions` so LayerNorm
+  reductions translate to MSL, and builds the POSIX async runtime for iOS.

@@ -47,14 +47,17 @@ doctest:
     cargo test --workspace --all-features --doc
 
 # ---- IREE ---------------------------------------------------------------------
-# Pinned: the runtime, its headers and the pip compiler must be one version
-# (vmfb is not ABI-stable). Keep in step with [workspace.metadata.iree] in
-# Cargo.toml.
+# The C runtime, headers and Metal compiler come from the fork snapshot.
+# The Python tooling uses its base release. Keep both pins in step with
+# [workspace.metadata.iree] in Cargo.toml.
 
-iree_version := "3.13.0"
-iree_commit := "89ece87b89852100c0a4ac3d515e14842d090967"
-iree_src := root / "third_party" / "iree"
-iree_build := root / "third_party" / "iree-build"
+iree_version := "3.14.0"
+iree_repo := "https://github.com/EdwinZhanCN/iree.git"
+iree_commit := "4ff3621d17896ee7b23d246a355ad915b9219a9e"
+iree_src := root / "third_party" / "iree-3.14"
+iree_build := root / "third_party" / "iree-build-3.14"
+iree_has_checkout := path_exists(iree_src / ".git")
+iree_head := if iree_has_checkout == "true" { trim(shell("git -C " + quote(iree_src) + " rev-parse --revs-only HEAD")) } else { "" }
 # Runtime-only submodules: flatcc is required, spirv_cross is for Metal, the
 # rest are pulled in by CMake even with tests off.
 iree_submodules := "third_party/flatcc third_party/spirv_cross third_party/benchmark third_party/googletest"
@@ -65,17 +68,19 @@ iree_cache_key := sha256(iree_commit + " " + iree_submodules + " " + iree_cmake_
 # Extra CMake flags pass through, e.g. -DIREE_HAL_DRIVER_VULKAN=ON.
 [doc("Build the IREE runtime static library in third_party/ (needs cmake and ninja)")]
 iree *cmake_args: _iree-clone
-    test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
     git -C {{ quote(iree_src) }} submodule update --init --depth 1 {{ iree_submodules }}
     cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(iree_build) }} {{ iree_cmake_flags }} {{ cmake_args }}
     ninja -C {{ quote(iree_build) }} iree_runtime_unified
     cargo clean -p iree-sys
 
 _iree-clone:
-    @{{ if path_exists(iree_src / ".git") == "true" { "git -C " + quote(iree_src) + " describe --tags" } else { "git clone --depth 1 --branch v" + iree_version + " https://github.com/iree-org/iree " + quote(iree_src) } }}
+    @{{ if iree_has_checkout == "true" { "" } else { "git init -q " + quote(iree_src) } }}
+    @{{ if iree_head == iree_commit { "" } else { "git -C " + quote(iree_src) + " fetch --depth 1 " + quote(iree_repo) + " " + iree_commit } }}
+    @{{ if iree_head == iree_commit { "" } else { "git -C " + quote(iree_src) + " checkout --detach " + iree_commit } }}
 
 venv := root / ".venv"
 venv_bin := venv / if os_family() == "windows" { "Scripts" } else { "bin" }
+venv_python := venv_bin / "python" + if os_family() == "windows" { ".exe" } else { "" }
 iree_compile := venv_bin / "iree-compile" + if os_family() == "windows" { ".exe" } else { "" }
 testdata_out := root / "testdata" / "build"
 
@@ -84,8 +89,8 @@ testdata_out := root / "testdata" / "build"
 testdata: _venv (_module "basic")
 
 _venv:
-    @{{ if path_exists(iree_compile) == "true" { "" } else { "uv venv --python 3.12 " + quote(venv) } }}
-    @{{ if path_exists(iree_compile) == "true" { "" } else { "uv pip install --python " + quote(venv) + " iree-base-compiler==" + iree_version } }}
+    @{{ if path_exists(venv_python) == "true" { "" } else { "uv venv --python 3.12 " + quote(venv) } }}
+    uv pip install --quiet --python {{ quote(venv_python) }} iree-base-compiler=={{ iree_version }}
 
 # Generic CPU on purpose: test artifacts must not depend on the host CPU.
 _module name: (_module-metal name)
@@ -120,7 +125,7 @@ ppocr_models := root / "third_party" / "ppocr-v6-tiny"
 esp_out := root / "third_party" / "esp-out"
 # The old CMake build directories contain absolute paths to the old sources.
 esp_plugin_build := root / "third_party" / "esp32p4-reference-build"
-esp_runtime_build := root / "third_party" / "iree-build-esp32p4"
+esp_runtime_build := root / "third_party" / "iree-build-esp32p4-3.14"
 esp_plugin := esp_plugin_build / if os_family() == "windows" { "espdl_host_plugin.dll" } else { "libespdl_host_plugin.so" }
 esp_ref_lib := esp_plugin_build / if os() == "macos" { "libespdl_ref.dylib" } else if os_family() == "windows" { "espdl_ref.dll" } else { "libespdl_ref.so" }
 # rv32imafc with the single-precision ABI. IREE codegen here is scalar.
@@ -185,8 +190,8 @@ esp-p4-kernel-test: esp-venv esp-plugin
 # IREE runtime for ESP32-P4 (generic platform, local-sync, static library
 # loader), built with ESP-IDF's GCC and picolibc. Uses the host build's
 # flatcc tool, so run `just iree` first.
-[doc("Cross-compile the IREE runtime for ESP32-P4 into third_party/iree-build-esp32p4")]
-esp-iree-p4:
+[doc("Cross-compile the IREE runtime for ESP32-P4 into third_party/iree-build-esp32p4-3.14")]
+esp-iree-p4: _iree-clone
     idf_env="$(idf -C {{ quote(esp_rec_app) }} env --shell)" && eval "$idf_env" && \
       cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(esp_runtime_build) }} -DCMAKE_TOOLCHAIN_FILE={{ quote(esp_backend / "cmake" / "p4_toolchain.cmake") }} -DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_HOST_BIN_DIR={{ quote(iree_build / "tools") }} && \
       ninja -C {{ quote(esp_runtime_build) }} iree_runtime_unified iree_hal_local_loaders_static_library_loader iree_hal_local_executable_library_util flatcc_parsing
@@ -244,16 +249,12 @@ bioclip-metal-profile:
     {{ quote(metal_py) }} {{ quote(metal_compiler / "dispatch_profile.py") }} {{ quote(bioclip_out / "vision.b1.r224.f16.decomposed.mlirbc") }} {{ quote(bioclip_out / "profile.decomposed") }} --iree-hal-target-device=metal
 
 # ---- Metal: MLX kernels through hal.dispatch.extern --------------------------
-# The pip compiler has no external Metal executables, so iree-compile is built
-# from the pinned IREE source with patches/iree-metal-external-executables.patch
-# (Metal target only, no torch input). Torch modules go through the pip
-# compiler to the input phase first; both are the same commit.
+# The fork includes external Metal executables and iOS SIMD-group support.
+# The source compiler builds the Metal target only; the pip compiler lowers
+# Torch modules to the input phase first.
 
-metal_iree_build := root / "third_party" / "iree-build-compiler"
+metal_iree_build := root / "third_party" / "iree-build-compiler-3.14"
 metal_iree_compile := metal_iree_build / "tools" / "iree-compile"
-# Compiler patches: external Metal executables, and SIMD-group functions for
-# iOS (SPIRV-Cross otherwise rejects reductions there).
-metal_iree_patches := quote(metal_compiler / "patches" / "iree-metal-external-executables.patch") + " " + quote(metal_compiler / "patches" / "iree-metal-ios-simdgroup.patch")
 metal_iree_cmake_flags := "-DCMAKE_BUILD_TYPE=Release -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF -DIREE_BUILD_COMPILER=ON -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_BUILD_PYTHON_BINDINGS=OFF -DIREE_BUILD_BUNDLED_LLVM=ON -DIREE_INPUT_TORCH=OFF -DIREE_INPUT_STABLEHLO=OFF -DIREE_INPUT_TOSA=OFF -DIREE_TARGET_BACKEND_DEFAULTS=OFF -DIREE_TARGET_BACKEND_METAL_SPIRV=ON -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_LOCAL_SYNC=ON -DIREE_ENABLE_ASSERTIONS=OFF -DLLVM_PARALLEL_LINK_JOBS=1"
 mlx_commit := "c23a35c9e6f4b26a2b851dda8c9e0630d13069ad"
 mlx_src := root / "third_party" / "mlx"
@@ -272,13 +273,11 @@ bioclip_mlx_rules := bioclip_linears + " --attention 1x257x16x64"
 bioclip_mlx_gemm_rules := bioclip_linears + " --gemm 16x257x257x64 --gemm 16x257x64x257"
 
 # Builds LLVM and MLIR from source: about 30 minutes on an M2 Pro. 4 jobs keep
-# peak memory near 6 GB. A rebuild after a patch change takes a few minutes.
-[doc("Build iree-compile with the Metal patches into third_party/iree-build-compiler")]
+# peak memory near 6 GB.
+[doc("Build the fork's Metal compiler into third_party/iree-build-compiler-3.14")]
 [macos]
 metal-iree-compiler: _iree-clone
-    test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
     git -C {{ quote(iree_src) }} submodule update --init --depth 1 third_party/llvm-project {{ iree_submodules }}
-    for p in {{ metal_iree_patches }}; do git -C {{ quote(iree_src) }} apply --reverse --check "$p" 2>/dev/null || git -C {{ quote(iree_src) }} apply "$p"; done
     cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(metal_iree_build) }} {{ metal_iree_cmake_flags }}
     ninja -C {{ quote(metal_iree_build) }} -j4 iree-compile
 
@@ -311,7 +310,7 @@ mlx-kernel-test: mlx-kernels
     {{ quote(metal_py) }} {{ quote(metal_compiler / "test_mlx_kernels.py") }} {{ quote(metal_iree_compile) }} {{ quote(mlx_lib) }} {{ quote(mlx_kernels_out / "test") }} {{ mlx_arch_flag }}
 
 # Lowers an export to the input phase with the pip compiler, then compiles it
-# with the patched one and the MLX rules; the rest stays on IREE's
+# with the fork compiler and the MLX rules; the rest stays on IREE's
 # metal-spirv codegen.
 _bioclip-mlx stem rules: mlx-kernels
     {{ quote(metal_bin / "iree-compile" + esp_exe) }} {{ quote(bioclip_out / stem + ".mlirbc") }} --iree-hal-target-device=metal --compile-to=input --emit-mlir-bytecode -o {{ quote(bioclip_out / stem + ".input.mlirbc") }}
@@ -341,8 +340,7 @@ bioclip-metal-mlx-profile: (_bioclip-mlx-profile "vision.b1.r224.f16")
 # device needs Developer Mode, and the app's signing team trusted on it
 # (Settings > General > VPN & Device Management) after the first install.
 
-ios_runtime_build := root / "third_party" / "iree-build-ios"
-ios_runtime_patch := metal_compiler / "patches" / "iree-ios-runtime.patch"
+ios_runtime_build := root / "third_party" / "iree-build-ios-3.14"
 ios_app := root / "backends" / "ios" / "apps" / "bench_bioclip"
 ios_bundle_id := "dev.iree-inference.bench-bioclip"
 # Signing team ID (Xcode > Settings > Accounts) and device name or UDID
@@ -356,17 +354,13 @@ ios_nax := "auto"
 ios_lib := mlx_kernels_out / "mlx_kernels.ios.metallib"
 ios_results := bioclip_out / "ios"
 
-# The async POSIX platform's Bazel targets leave out iOS, which the async
-# library still selects there; iree-ios-runtime.patch adds it (the upstream
-# fix, including the regenerated CMakeLists.txt). Local-task stays on:
-# drivers/init.c includes the Metal driver header inside its #if. Uses the
-# host build's flatcc tool, so run `just iree` first.
-[doc("Cross-compile the IREE runtime for iOS arm64 into third_party/iree-build-ios")]
+# The fork builds the async POSIX platform on iOS. Local-task stays on
+# because drivers/init.c includes the Metal header inside its #if.
+# Uses the host build's flatcc tool, so run `just iree` first.
+[doc("Cross-compile the IREE runtime for iOS arm64 into third_party/iree-build-ios-3.14")]
 [macos]
 ios-iree-runtime: _iree-clone
-    test "$(git -C {{ quote(iree_src) }} rev-parse HEAD)" = "{{ iree_commit }}"
     git -C {{ quote(iree_src) }} submodule update --init --depth 1 {{ iree_submodules }}
-    git -C {{ quote(iree_src) }} apply --reverse --check {{ quote(ios_runtime_patch) }} 2>/dev/null || git -C {{ quote(iree_src) }} apply {{ quote(ios_runtime_patch) }}
     cmake -G Ninja -S {{ quote(iree_src) }} -B {{ quote(ios_runtime_build) }} -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 -DIREE_HOST_BIN_DIR={{ quote(iree_build / "tools") }} {{ iree_cmake_flags }}
     ninja -C {{ quote(ios_runtime_build) }} -j4 iree_runtime_unified flatcc_parsing
 

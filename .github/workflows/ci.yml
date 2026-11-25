@@ -47,8 +47,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            third_party/iree
-            third_party/iree-build
+            third_party/iree-3.14
+            third_party/iree-build-3.14
           key: iree-${{ runner.os }}-${{ steps.iree-key.outputs.key }}
 
       - name: Build IREE runtime

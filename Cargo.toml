@@ -15,10 +15,10 @@ edition = "2024"
 publish = false
 
 [workspace.metadata.iree]
-# Must match the IREE runtime that iree-sys links against and the pip
-# `iree-base-compiler` used to produce .vmfb files (vmfb is not ABI-stable
-# across IREE versions).
-version = "3.13.0"
+# Base release for the Python tooling and source snapshot for the runtime.
+version = "3.14.0"
+repository = "https://github.com/EdwinZhanCN/iree.git"
+commit = "4ff3621d17896ee7b23d246a355ad915b9219a9e"
 
 # Tests: light optimisation only, so builds stay fast and stay debuggable.
 # Heavy compute (the embedding model on IREE) is C built by CMake in Release, unaffected.

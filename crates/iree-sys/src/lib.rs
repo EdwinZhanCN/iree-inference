@@ -4,7 +4,8 @@
 //! device-transfer and VM reflection functions needed to load `.vmfb` modules,
 //! pass tensors in, invoke exported functions and read tensors back.
 //!
-//! Pinned to **IREE v3.13.0**. Every `#[repr(C)]` struct and constant below is
+//! Targets the IREE 3.14-based fork pinned in the workspace manifest.
+//! Every `#[repr(C)]` struct and constant below is
 //! checked against the real C headers by the `layout` unit test (see
 //! `csrc/layout_check.c`); run `cargo test -p iree-sys` after bumping IREE.
 //!

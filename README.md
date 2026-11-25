@@ -8,10 +8,10 @@ contains the esp-dl adapter, host reference kernels, and ESP-IDF firmware.
 See the [architecture](docs/architecture.md) and the [ESP32-P4 backend
 guide](backends/esp32p4/README.md) for the PP-OCRv6 build and regression commands.
 
-The bindings target IREE 3.13.0, commit
-`89ece87b89852100c0a4ac3d515e14842d090967`. Use matching runtime headers,
-static libraries and `iree-base-compiler` when building VMFB modules; VMFB
-compatibility is not guaranteed across IREE versions.
+The runtime, headers and Metal source compiler use the
+[IREE fork snapshot after 3.14.0](https://github.com/EdwinZhanCN/iree/commit/4ff3621d17896ee7b23d246a355ad915b9219a9e).
+Python tooling uses the upstream IREE 3.14.0 packages. Rebuild VMFB modules
+when updating IREE because the bytecode ABI can change across versions.
 
 ## Build and test
 
@@ -20,17 +20,14 @@ Install Rust (the version in `rust-toolchain.toml`), CMake, Ninja, `just`,
 
 ```sh
 just iree       # fetch and build the pinned IREE runtime
-just testdata   # compile the test VMFB with the matching compiler
+just testdata   # compile the test VMFB with the 3.14.0 compiler
 just check
 ```
 
-IREE is fetched on demand, not stored as a submodule. `just iree` checks the
-checkout's commit before building and initializes the IREE submodules needed
-for this configuration. If an existing checkout is at a different commit,
-fix or remove that checkout and retry. Runtime source and build output are
-stored under the ignored `third_party/` directory. macOS also enables Metal;
-CPU drivers are enabled on all platforms. Run `just test-gpu` on macOS for
-Metal tests (requires the Metal Toolchain).
+`just iree` fetches the pinned commit into `third_party/iree-3.14`, initializes
+the required submodules, and builds into `third_party/iree-build-3.14`.
+macOS also enables Metal, and all platforms enable CPU drivers. Run
+`just test-gpu` on macOS for Metal tests (requires the Metal Toolchain).
 
 `IREE_SOURCE_DIR` and `IREE_RUNTIME_LIB_DIR` override the header checkout and
 runtime archive directory for external builds. The latter currently expects

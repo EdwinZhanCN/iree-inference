@@ -129,7 +129,7 @@ generated C reference vectors. [`apps/bench_rec/`](apps/bench_rec/) embeds
 the rec VMFB, static dispatch library, and a host-generated input/output pair.
 The `idf.toml` files select the ESP32-P4 revision and partition tables.
 `just esp-p4-rec` also cross-compiles the runtime under
-`third_party/iree-build-esp32p4/`. The reference plugin builds under
+`third_party/iree-build-esp32p4-3.14/`. The reference plugin builds under
 `third_party/esp32p4-reference-build/`.
 
 Use `just esp-ppocr-p4 rec iree` to build the IREE-only dispatch baseline.

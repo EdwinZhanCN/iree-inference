@@ -8,9 +8,9 @@
 //!    definitions of the pinned IREE version.
 //!
 //! Environment:
-//! - `IREE_SOURCE_DIR`      IREE checkout root (default: `<workspace>/third_party/iree`)
+//! - `IREE_SOURCE_DIR`      IREE checkout root (default: `<workspace>/third_party/iree-3.14`)
 //! - `IREE_RUNTIME_LIB_DIR` directory with `libiree_runtime_unified.a`
-//!   (default: `<workspace>/third_party/iree-build/runtime/src/iree/runtime`)
+//!   (default: `<workspace>/third_party/iree-build-3.14/runtime/src/iree/runtime`)
 //!
 //! `<workspace>/third_party` is where `just iree` clones and builds.
 
@@ -29,12 +29,12 @@ fn main() {
 
     let source_dir = env::var_os("IREE_SOURCE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| third_party.join("iree"));
+        .unwrap_or_else(|| third_party.join("iree-3.14"));
     let include_dir = source_dir.join("runtime/src");
 
     let lib_dir = env::var_os("IREE_RUNTIME_LIB_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| third_party.join("iree-build/runtime/src/iree/runtime"));
+        .unwrap_or_else(|| third_party.join("iree-build-3.14/runtime/src/iree/runtime"));
 
     // Missing files are not watched (cargo would rerun this script, and
     // rebuild everything above it, on every build). `just iree` ends with

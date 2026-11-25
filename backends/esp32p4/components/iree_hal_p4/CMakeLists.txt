@@ -1,8 +1,8 @@
 # IREE runtime for ESP32-P4, prebuilt by `just esp-iree-p4` with
 # p4_toolchain.cmake (generic platform, local-sync, static library loader).
 set(repo "${CMAKE_CURRENT_LIST_DIR}/../../../..")
-set(src "${repo}/third_party/iree/runtime/src")
-set(build "${repo}/third_party/iree-build-esp32p4")
+set(src "${repo}/third_party/iree-3.14/runtime/src")
+set(build "${repo}/third_party/iree-build-esp32p4-3.14")
 
 # The proactor replaces the runtime's iree_async_proactor_create_platform
 # (see the file); WHOLE_ARCHIVE keeps it ahead of the runtime archive.
