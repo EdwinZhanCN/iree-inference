@@ -64,6 +64,15 @@ def native_build(profile, target):
         for driver in ("metal", "vulkan", "cuda")
     ]
     if target == "aarch64-pc-windows-msvc":
+        elf_cmake = ROOT / "third_party/iree-3.14/runtime/src/iree/hal/local/elf/CMakeLists.txt"
+        guard = 'if(IREE_ARCH STREQUAL "x86_64")'
+        source = elf_cmake.read_text(encoding="utf-8")
+        if guard not in source:
+            # The fork's 64-bit check also matches ARM64 and adds an x64 object.
+            old_guard = "if(MSVC_C_ARCHITECTURE_ID MATCHES 64 OR MSVC_CXX_ARCHITECTURE_ID MATCHES 64)"
+            if source.count(old_guard) != 1:
+                raise SystemExit("IREE's embedded ELF MASM guard changed")
+            elf_cmake.write_text(source.replace(old_guard, guard), encoding="utf-8")
         # The baseline NEON kernels use Clang vector and FP16 intrinsics.
         # Keep the MSVC ABI while compiling them with Clang's CL frontend.
         opts.extend(
