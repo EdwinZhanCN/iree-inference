@@ -6,8 +6,11 @@
 #![cfg(iree_linked)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use iree_runtime::{BufferView, Device, ElementType, Instance, Session, StatusCode};
+use iree_runtime::{
+    BufferView, Device, ElementType, Fence, Instance, Semaphore, Session, StatusCode,
+};
 
 /// `IREE_TESTDATA_DIR`, else `<workspace>/testdata/build`.
 fn testdata_dir() -> PathBuf {
@@ -280,4 +283,136 @@ fn gpu_metal_abs() {
         .invoke_with(&[&x])
         .unwrap();
     assert_eq!(out[0].to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+fn basic_async_session(device: &Device) -> Session {
+    Session::from_file(device, testdata("basic_async.llvm-cpu.vmfb"))
+        .expect("load basic_async.vmfb")
+}
+
+#[test]
+fn semaphore_and_fence_lifecycle() {
+    let (_instance, device) = cpu();
+    let sem = Semaphore::new(&device, 0).unwrap();
+    assert_eq!(sem.query().unwrap(), 0);
+    assert!(!sem.wait_timeout(1, Duration::from_millis(1)).unwrap());
+
+    let mut fence = Fence::with_capacity(&device, 2).unwrap();
+    fence.insert(&sem, 1).unwrap();
+    assert!(!fence.is_signaled().unwrap());
+    assert!(!fence.wait_timeout(Duration::from_millis(1)).unwrap());
+
+    sem.signal(1).unwrap();
+    assert_eq!(sem.query().unwrap(), 1);
+    assert!(fence.is_signaled().unwrap());
+    fence.wait().unwrap();
+    assert!(fence.wait_timeout(Duration::from_millis(1)).unwrap());
+
+    let sem2 = Semaphore::new(&device, 5).unwrap();
+    fence.insert(&sem2, 7).unwrap();
+    assert!(!fence.is_signaled().unwrap());
+    sem2.signal(7).unwrap();
+    assert!(fence.is_signaled().unwrap());
+}
+
+#[test]
+fn async_call_pipeline_cpu() {
+    let (_instance, device) = cpu();
+    let session = basic_async_session(&device);
+    let func = session.lookup_async_function("basic_async.abs").unwrap();
+    assert!(func.is_async());
+    let mut call = func.call().unwrap();
+
+    // Independent per-slot semaphores avoid backward timeline signaling if
+    // CPU worker threads complete out of submission order.
+    let slots = 8usize;
+    let semaphores: Vec<_> = (0..slots)
+        .map(|_| Semaphore::new(&device, 0).unwrap())
+        .collect();
+    let mut pending = Vec::with_capacity(slots);
+    for (i, sem) in semaphores.iter().enumerate() {
+        let v = -((i + 1) as f32);
+        let x = BufferView::from_slice(&device, &[4], &[v; 4]).unwrap();
+        let sig = Fence::at(sem, 1).unwrap();
+        pending.push((i, call.invoke_async(&[&x], None, sig).unwrap()));
+    }
+
+    for (i, p) in pending.into_iter().rev() {
+        let out = p.wait().unwrap();
+        assert_eq!(out[0].to_vec::<f32>().unwrap(), vec![(i + 1) as f32; 4]);
+    }
+
+    // Chained dependency on device: abs(sum_and_product(a, b).0)
+    let mut sum_prod = session.call_async("basic_async.sum_and_product").unwrap();
+    let a = BufferView::from_slice(&device, &[4], &[-5.0f32, 1.0, -3.0, 2.0]).unwrap();
+    let b = BufferView::from_slice(&device, &[4], &[2.0f32, -4.0, 1.0, -6.0]).unwrap();
+    let sig1 = Fence::at(&semaphores[0], 2).unwrap();
+    let first = sum_prod.invoke_async(&[&a, &b], None, sig1).unwrap();
+    let sig2 = Fence::at(&semaphores[1], 2).unwrap();
+    let second = {
+        let sum_view = BufferView::from_slice(&device, &[4], &[-3.0f32, -3.0, -2.0, -4.0]).unwrap();
+        call.invoke_async(&[&sum_view], Some(first.signal_fence()), sig2)
+            .unwrap()
+    };
+    let out1 = first.wait().unwrap();
+    let out2 = second.wait().unwrap();
+    assert_eq!(
+        out1[0].to_vec::<f32>().unwrap(),
+        vec![-3.0, -3.0, -2.0, -4.0]
+    );
+    assert_eq!(
+        out1[1].to_vec::<f32>().unwrap(),
+        vec![-10.0, -4.0, -3.0, -12.0]
+    );
+    assert_eq!(out2[0].to_vec::<f32>().unwrap(), vec![3.0, 3.0, 2.0, 4.0]);
+}
+
+#[test]
+fn async_call_cross_thread_wait() {
+    let (_instance, device) = cpu();
+    let session = basic_async_session(&device);
+    let mut call = session.call_async("basic_async.abs").unwrap();
+    let sem = Semaphore::new(&device, 0).unwrap();
+    let x = BufferView::from_slice(&device, &[4], &[-9.0f32, 4.0, -2.5, 0.0]).unwrap();
+    let pending = call
+        .invoke_async(&[&x], None, Fence::at(&sem, 1).unwrap())
+        .unwrap();
+    let values = std::thread::spawn(move || pending.wait().unwrap()[0].to_vec::<f32>().unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(values, vec![9.0, 4.0, 2.5, 0.0]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "GPU: run with just test-gpu"]
+fn gpu_metal_async_pipeline() {
+    let vmfb = testdata_dir().join("basic_async.metal.vmfb");
+    assert!(
+        vmfb.is_file(),
+        "{} not compiled: just testdata, with Xcode's Metal Toolchain",
+        vmfb.display()
+    );
+    let instance = Instance::new().unwrap();
+    let device = instance
+        .create_device("metal")
+        .unwrap_or_else(|err| panic!("metal driver unavailable: {err}"));
+    let session = Session::from_file(&device, &vmfb).unwrap();
+    let mut call = session.call_async("basic_async.abs").unwrap();
+
+    let slots = 16usize;
+    let semaphores: Vec<_> = (0..slots)
+        .map(|_| Semaphore::new(&device, 0).unwrap())
+        .collect();
+    let mut pending = Vec::with_capacity(slots);
+    for (i, sem) in semaphores.iter().enumerate() {
+        let v = -((i + 1) as f32);
+        let x = BufferView::from_slice(&device, &[4], &[v; 4]).unwrap();
+        let sig = Fence::at(sem, 1).unwrap();
+        pending.push((i, call.invoke_async(&[&x], None, sig).unwrap()));
+    }
+    for (i, p) in pending {
+        let out = p.wait().unwrap();
+        assert_eq!(out[0].to_vec::<f32>().unwrap(), vec![(i + 1) as f32; 4]);
+    }
 }

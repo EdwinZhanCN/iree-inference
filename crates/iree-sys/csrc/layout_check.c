@@ -33,6 +33,8 @@ static const iree_sys_layout_entry_t kEntries[] = {
     SIZE(iree_hal_memory_access_t),
     SIZE(iree_hal_memory_type_t),
     SIZE(iree_hal_queue_affinity_t),
+    SIZE(iree_hal_semaphore_flags_t),
+    SIZE(iree_async_wait_flags_t),
     SIZE(iree_vm_context_flags_t),
     SIZE(iree_runtime_session_builtins_t),
 
@@ -128,6 +130,9 @@ static const iree_sys_layout_entry_t kEntries[] = {
     CONST(IREE_HAL_MEMORY_TYPE_OPTIMAL_FOR_DEVICE),
     CONST(IREE_HAL_QUEUE_AFFINITY_ANY),
     CONST(IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT),
+    CONST(IREE_HAL_SEMAPHORE_FLAG_NONE),
+    CONST(IREE_HAL_SEMAPHORE_FLAG_DEVICE_LOCAL),
+    CONST(IREE_ASYNC_WAIT_FLAG_NONE),
     CONST(IREE_HAL_ELEMENT_TYPE_NONE),
     CONST(IREE_HAL_ELEMENT_TYPE_BOOL_8),
     CONST(IREE_HAL_ELEMENT_TYPE_INT_8),

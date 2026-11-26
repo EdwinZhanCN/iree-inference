@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use iree_sys as sys;
 
 use crate::buffer_view::BufferView;
 use crate::error::{Error, Result, check};
 use crate::session::Session;
+use crate::sync::Fence;
 
 /// A reusable call builder (`iree_runtime_call_t`) for one exported function.
 ///
@@ -61,6 +64,27 @@ impl<'s> Call<'s> {
                 &mut self.raw,
                 input.as_ptr(),
             ))
+        }
+    }
+
+    /// Appends a [`Fence`] (typically for `$async` wait/signal fence arguments).
+    /// The list retains the fence, so `fence` may be dropped afterwards.
+    pub fn push_fence(&mut self, fence: &Fence) -> Result<()> {
+        // SAFETY: `self.raw` and `fence` are live; if `set_fence_retain` fails,
+        // roll back the list length so no null slot remains.
+        unsafe {
+            let inputs = sys::iree_runtime_call_inputs(&self.raw);
+            let idx = sys::iree_vm_list_size(inputs);
+            check(sys::iree_vm_list_resize(inputs, idx + 1))?;
+            if let Err(err) = check(sys::iree_vm_list_set_fence_retain(
+                inputs,
+                idx,
+                fence.as_ptr(),
+            )) {
+                let _ = sys::iree_vm_list_resize(inputs, idx);
+                return Err(err);
+            }
+            Ok(())
         }
     }
 
@@ -126,6 +150,87 @@ impl<'s> Call<'s> {
         // input buffers are not kept alive until the next call.
         self.reset();
         Ok(outputs)
+    }
+
+    /// Enqueues an `$async` invocation (`inputs..., wait_fence, signal_fence`)
+    /// and returns a [`PendingCall`] without blocking for device completion.
+    ///
+    /// Pass `wait = None` when there are no upstream fence dependencies (an
+    /// empty wait fence is supplied). The [`Call`] is reset before returning so
+    /// the caller can immediately enqueue more invocations on the same session.
+    pub fn invoke_async(
+        &mut self,
+        inputs: &[&BufferView],
+        wait: Option<&Fence>,
+        signal: Fence,
+    ) -> Result<PendingCall> {
+        self.reset();
+        let res = (|| {
+            for input in inputs {
+                self.push_input(input)?;
+            }
+            let empty_wait;
+            let wait_fence = match wait {
+                Some(fence) => fence,
+                None => {
+                    empty_wait = Fence::empty(self.session.device())?;
+                    &empty_wait
+                }
+            };
+            self.push_fence(wait_fence)?;
+            self.push_fence(&signal)?;
+            self.invoke()?;
+            let count = self.output_count();
+            let mut outputs = Vec::with_capacity(count);
+            for _ in 0..count {
+                outputs.push(self.pop_output()?);
+            }
+            Ok(outputs)
+        })();
+        self.reset();
+        res.map(|outputs| PendingCall { signal, outputs })
+    }
+}
+
+/// Output handles from an enqueued `$async` call awaiting completion on its
+/// signal [`Fence`].
+///
+/// The wrapped [`BufferView`]s are only released after [`PendingCall::wait`]
+/// confirms the device has finished writing them. `Send` + `!Sync`.
+#[derive(Debug)]
+pub struct PendingCall {
+    signal: Fence,
+    outputs: Vec<BufferView>,
+}
+
+impl PendingCall {
+    /// Non-blocking check for whether the enqueued device work has completed.
+    pub fn is_ready(&self) -> Result<bool> {
+        self.signal.is_signaled()
+    }
+
+    /// Read-only view of the signal fence for diagnostics or downstream waits.
+    pub fn signal_fence(&self) -> &Fence {
+        &self.signal
+    }
+
+    /// Blocks until the signal fence is reached and returns the output tensors.
+    pub fn wait(self) -> Result<Vec<BufferView>> {
+        self.signal.wait()?;
+        Ok(self.outputs)
+    }
+
+    /// Waits up to `timeout` for completion. Returns `Ok(Ok(outputs))` when
+    /// ready, `Ok(Err(self))` if the timeout expired, or `Err` on failure.
+    pub fn wait_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<std::result::Result<Vec<BufferView>, Self>> {
+        if self.signal.wait_timeout(timeout)? {
+            Ok(Ok(self.outputs))
+        } else {
+            Ok(Err(self))
+        }
     }
 }
 

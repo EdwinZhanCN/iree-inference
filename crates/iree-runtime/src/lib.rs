@@ -32,6 +32,8 @@
 //! | [`Session`] | ✓ | ✗ | thread-compatible: one thread at a time |
 //! | [`Function`], [`Call`] | ✗ | ✗ | borrow `&Session` |
 //! | [`BufferView`] | ✓ | ✗ | ref-counted, derived from a session |
+//! | [`Semaphore`] | ✓ | ✓ | ref-counted, thread-safe timeline semaphore |
+//! | [`Fence`], [`PendingCall`] | ✓ | ✗ | ref-counted, must not be mutated concurrently |
 //!
 //! These are enforced at compile time:
 //!
@@ -50,6 +52,16 @@
 //! is_sync::<iree_runtime::BufferView>();
 //! ```
 //!
+//! ```compile_fail,E0277
+//! fn is_sync<T: Sync>() {}
+//! is_sync::<iree_runtime::Fence>();
+//! ```
+//!
+//! ```compile_fail,E0277
+//! fn is_sync<T: Sync>() {}
+//! is_sync::<iree_runtime::PendingCall>();
+//! ```
+//!
 //! # Precision
 //!
 //! Precision is a compile-time property of the `.vmfb`; the runtime only sees the
@@ -62,13 +74,15 @@ mod element;
 mod error;
 mod instance;
 mod session;
+mod sync;
 
 pub use buffer_view::BufferView;
-pub use call::Call;
+pub use call::{Call, PendingCall};
 pub use element::{Element, ElementType};
 pub use error::{Error, Result, StatusCode};
 pub use instance::{Device, Instance};
 pub use session::{ABI_DECLARATION_ATTR, Function, FunctionInfo, Session};
+pub use sync::{Fence, Semaphore};
 
 /// Raw FFI bindings, for anything the safe API does not cover.
 pub use iree_sys as sys;
@@ -88,5 +102,9 @@ mod static_assertions {
         is_sync::<Device>();
         is_send::<Session>();
         is_send::<BufferView>();
+        is_send::<Semaphore>();
+        is_sync::<Semaphore>();
+        is_send::<Fence>();
+        is_send::<PendingCall>();
     }
 }

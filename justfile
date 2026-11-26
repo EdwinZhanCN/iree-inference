@@ -85,7 +85,7 @@ testdata_out := root / "testdata" / "build"
 
 # One dependency per module in testdata/.
 [doc("Compile the IREE test modules into testdata/build/ (needs uv)")]
-testdata: _venv (_module "basic")
+testdata: _venv (_module "basic") (_module "basic_async")
 
 _venv:
     @{{ if path_exists(venv_python) == "true" { "" } else { "uv venv --python 3.12 " + quote(venv) } }}

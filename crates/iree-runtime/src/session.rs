@@ -127,9 +127,24 @@ impl Session {
         })
     }
 
+    /// Looks up the `$async` entry point for `full_name` (appending `"$async"`
+    /// if not already present).
+    pub fn lookup_async_function(&self, full_name: &str) -> Result<Function<'_>> {
+        if full_name.ends_with("$async") {
+            self.lookup_function(full_name)
+        } else {
+            self.lookup_function(&format!("{full_name}$async"))
+        }
+    }
+
     /// Convenience: `lookup_function(name)?.call()`.
     pub fn call(&self, full_name: &str) -> Result<Call<'_>> {
         self.lookup_function(full_name)?.call()
+    }
+
+    /// Convenience: `lookup_async_function(name)?.call()`.
+    pub fn call_async(&self, full_name: &str) -> Result<Call<'_>> {
+        self.lookup_async_function(full_name)?.call()
     }
 
     /// Lists exported functions of every module in the session (including
@@ -246,6 +261,11 @@ impl<'s> Function<'s> {
     /// Returns `None` for variadic or unparseable conventions.
     pub fn arity(&self) -> Option<(usize, usize)> {
         parse_arity(&self.calling_convention())
+    }
+
+    /// Returns whether this handle refers to an `$async` coarse-fences entry point.
+    pub fn is_async(&self) -> bool {
+        self.full_name.ends_with("$async")
     }
 
     /// Creates a reusable call builder for this function.

@@ -50,6 +50,9 @@ opaque!(
     iree_hal_allocator_t,
     iree_hal_buffer_t,
     iree_hal_buffer_view_t,
+    iree_hal_semaphore_t,
+    iree_hal_fence_t,
+    iree_async_frontier_t,
     iree_vm_instance_t,
     iree_vm_context_t,
     iree_vm_module_t,
@@ -229,6 +232,15 @@ pub const fn iree_infinite_timeout() -> iree_timeout_t {
     iree_timeout_t {
         type_: IREE_TIMEOUT_ABSOLUTE,
         nanos: IREE_TIME_INFINITE_FUTURE,
+    }
+}
+
+/// `static inline iree_make_timeout_ns(iree_duration_t timeout_ns)`
+#[inline]
+pub const fn iree_make_timeout_ns(timeout_ns: iree_time_t) -> iree_timeout_t {
+    iree_timeout_t {
+        type_: IREE_TIMEOUT_RELATIVE,
+        nanos: timeout_ns,
     }
 }
 
@@ -437,6 +449,13 @@ pub const IREE_HAL_QUEUE_AFFINITY_ANY: iree_hal_queue_affinity_t = u64::MAX;
 pub type iree_hal_transfer_buffer_flags_t = u32;
 pub const IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT: iree_hal_transfer_buffer_flags_t = 0;
 
+pub type iree_hal_semaphore_flags_t = u64;
+pub const IREE_HAL_SEMAPHORE_FLAG_NONE: iree_hal_semaphore_flags_t = 0;
+pub const IREE_HAL_SEMAPHORE_FLAG_DEVICE_LOCAL: iree_hal_semaphore_flags_t = 1;
+
+pub type iree_async_wait_flags_t = u32;
+pub const IREE_ASYNC_WAIT_FLAG_NONE: iree_async_wait_flags_t = 0;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct iree_hal_buffer_params_t {
@@ -568,8 +587,17 @@ unsafe extern "C" {
         out_buffer_view: *mut *mut iree_hal_buffer_view_t,
     ) -> iree_status_t;
 
-    // --- vm: reflection ---
+    // --- vm: reflection & list helpers ---
     pub fn iree_vm_list_size(list: *const iree_vm_list_t) -> iree_host_size_t;
+    pub fn iree_vm_list_resize(
+        list: *mut iree_vm_list_t,
+        new_size: iree_host_size_t,
+    ) -> iree_status_t;
+    pub fn iree_vm_list_set_fence_retain(
+        list: *mut iree_vm_list_t,
+        i: iree_host_size_t,
+        value: *mut iree_hal_fence_t,
+    ) -> iree_status_t;
     pub fn iree_vm_context_module_count(context: *const iree_vm_context_t) -> iree_host_size_t;
     pub fn iree_vm_context_module_at(
         context: *const iree_vm_context_t,
@@ -647,6 +675,65 @@ unsafe extern "C" {
     pub fn iree_hal_buffer_view_byte_length(
         buffer_view: *const iree_hal_buffer_view_t,
     ) -> iree_device_size_t;
+
+    // --- hal: semaphore ---
+    pub fn iree_hal_semaphore_create(
+        device: *mut iree_hal_device_t,
+        queue_affinity: iree_hal_queue_affinity_t,
+        initial_value: u64,
+        flags: iree_hal_semaphore_flags_t,
+        out_semaphore: *mut *mut iree_hal_semaphore_t,
+    ) -> iree_status_t;
+    pub fn iree_hal_semaphore_retain(semaphore: *mut iree_hal_semaphore_t);
+    pub fn iree_hal_semaphore_release(semaphore: *mut iree_hal_semaphore_t);
+    pub fn iree_hal_semaphore_query(
+        semaphore: *mut iree_hal_semaphore_t,
+        out_value: *mut u64,
+    ) -> iree_status_t;
+    pub fn iree_hal_semaphore_signal(
+        semaphore: *mut iree_hal_semaphore_t,
+        new_value: u64,
+        frontier: *const iree_async_frontier_t,
+    ) -> iree_status_t;
+    pub fn iree_hal_semaphore_fail(semaphore: *mut iree_hal_semaphore_t, status: iree_status_t);
+    pub fn iree_hal_semaphore_wait(
+        semaphore: *mut iree_hal_semaphore_t,
+        value: u64,
+        timeout: iree_timeout_t,
+        flags: iree_async_wait_flags_t,
+    ) -> iree_status_t;
+
+    // --- hal: fence ---
+    pub fn iree_hal_fence_create(
+        capacity: iree_host_size_t,
+        host_allocator: iree_allocator_t,
+        out_fence: *mut *mut iree_hal_fence_t,
+    ) -> iree_status_t;
+    pub fn iree_hal_fence_create_at(
+        semaphore: *mut iree_hal_semaphore_t,
+        value: u64,
+        host_allocator: iree_allocator_t,
+        out_fence: *mut *mut iree_hal_fence_t,
+    ) -> iree_status_t;
+    pub fn iree_hal_fence_retain(fence: *mut iree_hal_fence_t);
+    pub fn iree_hal_fence_release(fence: *mut iree_hal_fence_t);
+    pub fn iree_hal_fence_insert(
+        fence: *mut iree_hal_fence_t,
+        semaphore: *mut iree_hal_semaphore_t,
+        value: u64,
+    ) -> iree_status_t;
+    pub fn iree_hal_fence_extend(
+        into_fence: *mut iree_hal_fence_t,
+        from_fence: *mut iree_hal_fence_t,
+    ) -> iree_status_t;
+    pub fn iree_hal_fence_query(fence: *mut iree_hal_fence_t) -> iree_status_t;
+    pub fn iree_hal_fence_signal(fence: *mut iree_hal_fence_t) -> iree_status_t;
+    pub fn iree_hal_fence_fail(fence: *mut iree_hal_fence_t, signal_status: iree_status_t);
+    pub fn iree_hal_fence_wait(
+        fence: *mut iree_hal_fence_t,
+        timeout: iree_timeout_t,
+        flags: iree_async_wait_flags_t,
+    ) -> iree_status_t;
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +809,8 @@ mod layout {
         size!(v, "iree_hal_memory_access_t", iree_hal_memory_access_t);
         size!(v, "iree_hal_memory_type_t", iree_hal_memory_type_t);
         size!(v, "iree_hal_queue_affinity_t", iree_hal_queue_affinity_t);
+        size!(v, "iree_hal_semaphore_flags_t", iree_hal_semaphore_flags_t);
+        size!(v, "iree_async_wait_flags_t", iree_async_wait_flags_t);
         size!(v, "iree_vm_context_flags_t", iree_vm_context_flags_t);
         size!(
             v,
@@ -966,6 +1055,9 @@ mod layout {
         konst!(v, IREE_HAL_MEMORY_TYPE_OPTIMAL_FOR_DEVICE);
         konst!(v, IREE_HAL_QUEUE_AFFINITY_ANY);
         konst!(v, IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT);
+        konst!(v, IREE_HAL_SEMAPHORE_FLAG_NONE);
+        konst!(v, IREE_HAL_SEMAPHORE_FLAG_DEVICE_LOCAL);
+        konst!(v, IREE_ASYNC_WAIT_FLAG_NONE);
         konst!(v, IREE_HAL_ELEMENT_TYPE_NONE);
         konst!(v, IREE_HAL_ELEMENT_TYPE_BOOL_8);
         konst!(v, IREE_HAL_ELEMENT_TYPE_INT_8);
