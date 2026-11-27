@@ -9,7 +9,7 @@ on:
         default: cpu
         options: [cpu, metal, vulkan, cuda, vulkan-cuda]
       target:
-        description: Build only this target triple (default: every supported target)
+        description: "Build only this target triple; empty builds every supported target"
         type: string
         default: ""
       publish:
