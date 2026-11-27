@@ -18,11 +18,13 @@ the enabled driver features.
 | CPU | macOS, Linux GNU and Windows MSVC on x86-64 and ARM64 |
 | Metal | macOS ARM64 |
 | Vulkan | Linux GNU and Windows MSVC on x86-64 and ARM64 |
-| CUDA and Vulkan + CUDA | Linux GNU on x86-64 and ARM64, Windows MSVC on x86-64 |
+| CUDA and Vulkan + CUDA | Linux GNU and Windows MSVC on x86-64 and ARM64 |
 
-The current IREE snapshot's CUDA toolkit fetcher lacks a Windows ARM64 SDK
-configuration. GPU inference on the target driver is qualified separately from
-the release job's CPU link and VMFB smoke test.
+The IREE snapshot's CUDA toolkit fetcher has no Windows ARM64 package. The
+runtime build needs only `cuda.h` and libdevice, which do not depend on the
+platform, so the Windows ARM64 build takes them from the Windows x64 package of
+the same CUDA version. GPU inference on the target driver is qualified
+separately from the release job's CPU link and VMFB smoke test.
 
 ## Where the native files come from
 
@@ -42,10 +44,11 @@ profile. Set `CARGO_NET_OFFLINE=true` to prevent downloads during the build.
 ## Publish a native profile
 
 Run the [Native runtime release workflow](../.github/workflows/runtime-release.yml)
-with the desired profile. The workflow compiles the native libraries, packages
+with the desired profile, and optionally one target. The workflow compiles the native libraries, packages
 them with a manifest and validates each target with a clean external Git
 dependency using stable Cargo. Set the workflow's publish input to publish
-the verified assets to GitHub Releases.
+the verified assets to GitHub Releases. When the profile's release exists,
+the new target's files are added to it and the existing files stay.
 
 The packaging and smoke test also run locally. For example, after
 `just iree` and `just testdata` on Apple Silicon:

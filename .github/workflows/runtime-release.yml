@@ -8,6 +8,10 @@ on:
         type: choice
         default: cpu
         options: [cpu, metal, vulkan, cuda, vulkan-cuda]
+      target:
+        description: Build only this target triple (default: every supported target)
+        type: string
+        default: ""
       publish:
         description: Publish the tested assets to GitHub Releases
         type: boolean
@@ -31,8 +35,9 @@ jobs:
       - id: matrix
         env:
           PROFILE: ${{ inputs.profile }}
+          TARGET: ${{ inputs.target }}
         run: |
-          echo "value=$(python3 tools/runtime-release.py matrix "$PROFILE")" >> "$GITHUB_OUTPUT"
+          echo "value=$(python3 tools/runtime-release.py matrix "$PROFILE" --target "$TARGET")" >> "$GITHUB_OUTPUT"
           echo "revision=$(cat crates/iree-sys/runtime-revision)" >> "$GITHUB_OUTPUT"
 
       # The same embedded-ELF fixtures run on all three host operating systems.
@@ -112,10 +117,15 @@ jobs:
           pattern: runtime-files-*
           merge-multiple: true
           path: assets/
+      # A release that exists gains the new targets; its files never change.
       - name: Publish verified runtime files
         run: |
           tag="runtime-v1-$REVISION-$PROFILE"
-          gh release create "$tag" assets/* --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "IREE runtime $PROFILE ($REVISION)" \
-            --notes "Native runtime files validated with a clean Cargo consumer." \
-            --latest=false
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" assets/* --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" assets/* --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "IREE runtime $PROFILE ($REVISION)" \
+              --notes "Native runtime files validated with a clean Cargo consumer." \
+              --latest=false
+          fi
