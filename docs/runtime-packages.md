@@ -21,7 +21,7 @@ the enabled driver features.
 | CUDA and Vulkan + CUDA | Linux GNU and Windows MSVC on x86-64 and ARM64 |
 
 The IREE snapshot's CUDA toolkit fetcher has no Windows ARM64 package. The
-runtime build needs only `cuda.h` and libdevice, which do not depend on the
+runtime build needs only CUDA headers and libdevice, which do not depend on the
 platform, so the Windows ARM64 build takes them from the Windows x64 package of
 the same CUDA version. GPU inference on the target driver is qualified
 separately from the release job's CPU link and VMFB smoke test.
