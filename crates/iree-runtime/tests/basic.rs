@@ -285,6 +285,77 @@ fn gpu_metal_abs() {
     assert_eq!(out[0].to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
 }
 
+/// `x + weight`, where `weights.mlir` stores `weight[i] = i * 0.25 - 128`.
+fn check_weights(device: &Device, session: &Session) {
+    let x: Vec<f32> = (0..1024).map(|i| (i % 7) as f32).collect();
+    let input = BufferView::from_slice(device, &[1024], &x).unwrap();
+    let out = session
+        .call("weights.add_weights")
+        .unwrap()
+        .invoke_with(&[&input])
+        .unwrap();
+    let expected: Vec<f32> = (0..1024)
+        .map(|i| (i % 7) as f32 + i as f32 * 0.25 - 128.0)
+        .collect();
+    assert_eq!(out[0].to_vec::<f32>().unwrap(), expected);
+}
+
+#[test]
+fn module_file_weights_are_read_from_the_mapping() {
+    let (_instance, device) = cpu();
+    let session = Session::from_file(&device, testdata("weights.llvm-cpu.vmfb")).unwrap();
+    check_weights(&device, &session);
+    // Twice: the mapping stays valid across calls.
+    check_weights(&device, &session);
+}
+
+#[test]
+fn missing_module_file_is_not_found() {
+    let (_instance, device) = cpu();
+    let err = Session::from_file(&device, testdata_dir().join("no-such.vmfb")).unwrap_err();
+    assert_eq!(err.code(), StatusCode::NotFound, "{err}");
+}
+
+/// Updates rename a new file over the old one; a loaded session keeps the
+/// contents it mapped. (Windows refuses the rename while the file is mapped.)
+#[cfg(unix)]
+#[test]
+fn loaded_module_file_survives_a_rename_over_it() {
+    let dir = std::env::temp_dir().join(format!("iree-runtime-rename-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("model.vmfb");
+    std::fs::copy(testdata("weights.llvm-cpu.vmfb"), &path).unwrap();
+
+    let (_instance, device) = cpu();
+    let session = Session::from_file(&device, &path).unwrap();
+    let replacement = dir.join("model.vmfb.part");
+    std::fs::copy(testdata("basic.llvm-cpu.vmfb"), &replacement).unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    check_weights(&device, &session);
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Metal reads the weights from the mapped file too.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "GPU: run with just test-gpu"]
+fn gpu_metal_weights() {
+    let vmfb = testdata_dir().join("weights.metal.vmfb");
+    assert!(
+        vmfb.is_file(),
+        "{} not compiled: just testdata, with Xcode's Metal Toolchain",
+        vmfb.display()
+    );
+    let instance = Instance::new().unwrap();
+    let device = instance
+        .create_device("metal")
+        .unwrap_or_else(|err| panic!("metal driver unavailable: {err}"));
+    let session = Session::from_file(&device, &vmfb).unwrap();
+    check_weights(&device, &session);
+}
+
 fn basic_async_session(device: &Device) -> Session {
     Session::from_file(device, testdata("basic_async.llvm-cpu.vmfb"))
         .expect("load basic_async.vmfb")

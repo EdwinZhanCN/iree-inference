@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -64,19 +63,31 @@ impl Session {
         Ok(session)
     }
 
-    /// Appends a `.vmfb` bytecode module loaded from disk (IREE reads/maps the
-    /// file itself and keeps the contents alive for the session's lifetime).
+    /// Appends a `.vmfb` bytecode module mapped from disk.
+    ///
+    /// The file is mapped copy-on-write, not read: weights and executables stay
+    /// clean file-backed pages that the OS can drop under memory pressure and
+    /// read back, so the module costs no heap memory of its own. (IREE's
+    /// `append_bytecode_module_from_file` reads the whole file into the heap.)
+    /// The mapping lives as long as the module.
+    ///
+    /// Replace a loaded file by renaming a new one over it; never truncate or
+    /// rewrite it in place while a session uses it. On Windows a mapped file
+    /// cannot be deleted or renamed over until its sessions are dropped.
     ///
     /// Modules must be appended before the first call (the VM context freezes).
     pub fn load_module_file(&mut self, vmfb: impl AsRef<Path>) -> Result<()> {
-        let path = vmfb.as_ref();
-        let c_path = path_to_cstring(path)?;
-        // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+        let (data, allocator) = map_file(vmfb.as_ref())?;
+        // SAFETY: `data` + `allocator` form an owned mapping that IREE releases
+        // through `unmap_ctl`, even if loading fails.
         unsafe {
-            check(sys::iree_runtime_session_append_bytecode_module_from_file(
-                self.raw.as_ptr(),
-                c_path.as_ptr(),
-            ))
+            check(
+                sys::iree_runtime_session_append_bytecode_module_from_memory(
+                    self.raw.as_ptr(),
+                    data,
+                    allocator,
+                ),
+            )
         }
     }
 
@@ -87,7 +98,8 @@ impl Session {
     /// executables is aligned relative to the archive start). The runtime keeps
     /// the copy alive for the session's lifetime and frees it itself, so `vmfb`
     /// can be dropped right after this returns. Prefer
-    /// [`load_module_file`](Self::load_module_file) for large models (mmap).
+    /// [`load_module_file`](Self::load_module_file) for large models: it maps
+    /// the file instead of holding a copy.
     pub fn load_module_bytes(&mut self, vmfb: &[u8]) -> Result<()> {
         let (data, allocator) = aligned_copy(vmfb)?;
         // SAFETY: `data` + `allocator` form an owned allocation that IREE frees
@@ -386,25 +398,65 @@ unsafe extern "C" fn aligned_free_ctl(
     std::ptr::null_mut()
 }
 
-fn path_to_cstring(path: &Path) -> Result<CString> {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
+/// Maps `path` copy-on-write and returns the mapping with an `iree_allocator_t`
+/// whose ctl unmaps it. The mapping is boxed and carried in the allocator's
+/// `self` pointer. A mapping starts on a page boundary, which satisfies
+/// [`MODULE_ALIGN`].
+fn map_file(path: &Path) -> Result<(sys::iree_const_byte_span_t, sys::iree_allocator_t)> {
+    let file = std::fs::File::open(path).map_err(|err| Error::io(path, &err))?;
+    let length = file.metadata().map_err(|err| Error::io(path, &err))?.len();
+    if length == 0 {
+        return Err(Error::invalid_argument(format!(
+            "empty vmfb: {}",
+            path.display()
+        )));
+    }
+    // SAFETY: the mapping is private, so writes by this process never reach the
+    // file. Other processes must not truncate or rewrite the file in place
+    // while it is mapped (documented on `load_module_file`); replacing it by
+    // rename leaves this mapping on the old contents.
+    let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file) }
+        .map_err(|err| Error::io(path, &err))?;
+    let span = sys::iree_const_byte_span_t {
+        data: map.as_ptr(),
+        data_length: map.len(),
     };
-    #[cfg(not(unix))]
-    let bytes = path
-        .to_str()
-        .ok_or_else(|| Error::invalid_argument(format!("non-UTF-8 path: {}", path.display())))?
-        .as_bytes()
-        .to_vec();
-    CString::new(bytes)
-        .map_err(|_| Error::invalid_argument(format!("path contains NUL: {}", path.display())))
+    debug_assert_eq!(span.data as usize % MODULE_ALIGN, 0);
+    let allocator = sys::iree_allocator_t {
+        self_: Box::into_raw(Box::new(map)).cast(),
+        ctl: Some(unmap_ctl),
+    };
+    Ok((span, allocator))
+}
+
+/// Allocator ctl that only supports FREE of a mapping made by [`map_file`].
+/// Never panics (it is called from C).
+unsafe extern "C" fn unmap_ctl(
+    self_: *mut std::ffi::c_void,
+    command: sys::iree_allocator_command_t,
+    _params: *const std::ffi::c_void,
+    inout_ptr: *mut *mut std::ffi::c_void,
+) -> sys::iree_status_t {
+    if command != sys::IREE_ALLOCATOR_COMMAND_FREE {
+        return sys::iree_status_from_code(sys::IREE_STATUS_UNIMPLEMENTED);
+    }
+    if inout_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: IREE frees the module data exactly once, passing back the pointer
+    // from `map_file`; `self_` is the box that owns its mapping.
+    unsafe {
+        if !(*inout_ptr).is_null() {
+            drop(Box::from_raw(self_.cast::<memmap2::Mmap>()));
+            *inout_ptr = std::ptr::null_mut();
+        }
+    }
+    std::ptr::null_mut()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MODULE_ALIGN, aligned_copy, parse_arity};
+    use super::{MODULE_ALIGN, aligned_copy, map_file, parse_arity};
     use iree_sys as sys;
 
     #[test]
@@ -446,6 +498,56 @@ mod tests {
         );
 
         assert!(aligned_copy(&[]).is_err());
+    }
+
+    #[test]
+    fn map_file_maps_and_unmaps() {
+        let dir = std::env::temp_dir().join(format!("iree-runtime-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("module.vmfb");
+        let data: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let (span, allocator) = map_file(&path).unwrap();
+        assert_eq!(span.data as usize % MODULE_ALIGN, 0);
+        assert_eq!(span.data_length, data.len());
+        let mapped = unsafe { std::slice::from_raw_parts(span.data, span.data_length) };
+        assert_eq!(mapped, &data[..]);
+
+        // Unmap exactly the way iree_allocator_free does.
+        let ctl = allocator.ctl.unwrap();
+        let mut dummy = std::ptr::null_mut();
+        let status = unsafe {
+            ctl(
+                allocator.self_,
+                sys::IREE_ALLOCATOR_COMMAND_MALLOC,
+                std::ptr::null(),
+                &mut dummy,
+            )
+        };
+        assert_eq!(
+            sys::iree_status_code(status),
+            sys::IREE_STATUS_UNIMPLEMENTED
+        );
+        let mut ptr = span.data as *mut std::ffi::c_void;
+        let status = unsafe {
+            ctl(
+                allocator.self_,
+                sys::IREE_ALLOCATOR_COMMAND_FREE,
+                std::ptr::null(),
+                &mut ptr,
+            )
+        };
+        assert!(sys::iree_status_is_ok(status));
+        assert!(ptr.is_null());
+        // Unmapped, so the file can go on every platform.
+        std::fs::remove_file(&path).unwrap();
+
+        let missing = map_file(&path).unwrap_err();
+        assert_eq!(missing.code(), crate::StatusCode::NotFound);
+        std::fs::write(&path, b"").unwrap();
+        assert!(map_file(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

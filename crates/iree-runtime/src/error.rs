@@ -74,6 +74,19 @@ impl Error {
         }
     }
 
+    /// A file error raised on the Rust side, with the code IREE would use.
+    pub(crate) fn io(path: &std::path::Path, err: &std::io::Error) -> Self {
+        let code = match err.kind() {
+            std::io::ErrorKind::NotFound => StatusCode::NotFound,
+            std::io::ErrorKind::PermissionDenied => StatusCode::PermissionDenied,
+            _ => StatusCode::Unavailable,
+        };
+        Self {
+            code,
+            message: format!("{}: {err}", path.display()),
+        }
+    }
+
     /// Converts a non-OK `iree_status_t` into an `Error`, taking ownership of
     /// (and freeing) the status.
     ///

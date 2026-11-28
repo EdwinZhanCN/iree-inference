@@ -17,3 +17,4 @@ cuda = ["iree-sys/cuda"]
 [dependencies]
 iree-sys.workspace = true
 half = { version = "2", optional = true }
+memmap2 = "0.9"
